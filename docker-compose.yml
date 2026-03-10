@@ -1,34 +1,22 @@
 services:
   server:
-    container_name: code-sync-server
-    build:
-      context: ./server
-      dockerfile: Dockerfile
-      target: runner
-    volumes:
-      - ./server:/app
-      - /build/node_modules
+    image: yourdockerhubusername/code-coalition-server:latest
+    container_name: code-coalition-server
     networks:
-      - Code-Sync
+      - Code-Coalition
     ports:
       - "3000:3000"
 
   client:
-    container_name: code-sync-client
-    build:
-      context: ./client
-      dockerfile: Dockerfile
-      target: runner
-    volumes:
-      - ./client:/app
-      - /build/node_modules
+    image: yourdockerhubusername/code-coalition-client:latest
+    container_name: code-coalition-client
     networks:
-      - Code-Sync
+      - Code-Coalition
     ports:
       - "5173:5173"
     depends_on:
       - server
 
 networks:
-  Code-Sync:
+  Code-Coalition:
     driver: bridge

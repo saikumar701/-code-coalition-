@@ -17,6 +17,95 @@ import {
 import { toast } from "react-hot-toast"
 import TreeNode from "./TreeNode"
 
+const textMimeByExtension: Record<string, string> = {
+    c: "text/x-csrc",
+    cpp: "text/x-c++src",
+    css: "text/css",
+    go: "text/x-go",
+    h: "text/x-csrc",
+    hpp: "text/x-c++src",
+    html: "text/html",
+    java: "text/x-java-source",
+    js: "text/javascript",
+    json: "application/json",
+    jsx: "text/javascript",
+    md: "text/markdown",
+    py: "text/x-python",
+    rs: "text/x-rust",
+    sh: "text/x-shellscript",
+    sql: "text/x-sql",
+    ts: "text/typescript",
+    tsx: "text/typescript",
+    txt: "text/plain",
+    xml: "application/xml",
+    yaml: "text/yaml",
+    yml: "text/yaml",
+}
+
+const likelyBinaryExtensions = new Set([
+    "7z",
+    "avi",
+    "bmp",
+    "class",
+    "dll",
+    "doc",
+    "docx",
+    "exe",
+    "gif",
+    "gz",
+    "ico",
+    "jar",
+    "jpeg",
+    "jpg",
+    "mov",
+    "mp3",
+    "mp4",
+    "pdf",
+    "png",
+    "ppt",
+    "pptx",
+    "so",
+    "tar",
+    "wav",
+    "webm",
+    "webp",
+    "xls",
+    "xlsx",
+    "zip",
+])
+
+function getFileExtension(fileName: string): string {
+    const splitName = fileName.toLowerCase().split(".")
+    return splitName.length > 1 ? splitName.pop() || "" : ""
+}
+
+function resolveMimeTypeForFile(file: File): string {
+    if (file.type) return file.type
+    const extension = getFileExtension(file.name)
+    if (extension && textMimeByExtension[extension]) {
+        return textMimeByExtension[extension]
+    }
+    if (extension && likelyBinaryExtensions.has(extension)) {
+        return "application/octet-stream"
+    }
+    return "text/plain"
+}
+
+function isLikelyTextFile(file: File, resolvedMimeType: string): boolean {
+    if (resolvedMimeType.startsWith("text/")) return true
+    if (
+        /(json|javascript|typescript|xml|csv|yaml|yml|svg|markdown|x-python|x-java|x-go|x-rust|x-shell|x-c)/i.test(
+            resolvedMimeType,
+        )
+    ) {
+        return true
+    }
+
+    const extension = getFileExtension(file.name)
+    if (!extension) return !file.type
+    return !likelyBinaryExtensions.has(extension)
+}
+
 function FileStructureView() {
     const {
         fileStructure,
@@ -105,16 +194,15 @@ function FileStructureView() {
     ): Promise<{ content: string; contentEncoding: "utf8" | "base64"; mimeType: string }> =>
         new Promise((resolve, reject) => {
             const reader = new FileReader()
-            const isLikelyText =
-                file.type.startsWith("text/") ||
-                /(json|javascript|typescript|xml|csv|yaml|yml|svg)/i.test(file.type)
+            const resolvedMimeType = resolveMimeTypeForFile(file)
+            const shouldReadAsText = isLikelyTextFile(file, resolvedMimeType)
 
             reader.onload = () => {
-                if (isLikelyText) {
+                if (shouldReadAsText) {
                     resolve({
                         content: (reader.result as string) || "",
                         contentEncoding: "utf8",
-                        mimeType: file.type || "text/plain",
+                        mimeType: resolvedMimeType,
                     })
                     return
                 }
@@ -124,12 +212,12 @@ function FileStructureView() {
                 resolve({
                     content: base64Content,
                     contentEncoding: "base64",
-                    mimeType: file.type || "application/octet-stream",
+                    mimeType: resolvedMimeType || "application/octet-stream",
                 })
             }
 
             reader.onerror = reject
-            if (isLikelyText) {
+            if (shouldReadAsText) {
                 reader.readAsText(file)
             } else {
                 reader.readAsDataURL(file)
@@ -168,7 +256,7 @@ function FileStructureView() {
         for (let index = 0; index < files.length; index += 1) {
             const file = files[index]
             const filePayload = await readFileContent(file)
-            importFile(targetDirectoryId, file.name, filePayload.content, false, {
+            importFile(targetDirectoryId, file.name, filePayload.content, true, {
                 contentEncoding: filePayload.contentEncoding,
                 mimeType: filePayload.mimeType,
             })
@@ -207,7 +295,7 @@ function FileStructureView() {
                 )
             }
 
-            importFile(currentParentId, fileName, filePayload.content, false, {
+            importFile(currentParentId, fileName, filePayload.content, true, {
                 contentEncoding: filePayload.contentEncoding,
                 mimeType: filePayload.mimeType,
             })

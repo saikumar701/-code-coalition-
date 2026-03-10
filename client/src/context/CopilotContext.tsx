@@ -1,11 +1,11 @@
 import { ICopilotContext } from "@/types/copilot"
+import { BACKEND_URL } from "@/config/backend"
 import axios from "axios"
 import { ReactNode, createContext, useContext, useState } from "react"
 import toast from "react-hot-toast"
 
 const CopilotContext = createContext<ICopilotContext | null>(null)
 
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL
 const COPILOT_ENDPOINT = BACKEND_URL
     ? `${BACKEND_URL}/api/copilot/generate`
     : "/api/copilot/generate"

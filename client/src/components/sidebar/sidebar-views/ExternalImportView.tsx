@@ -4,7 +4,9 @@ import {
     fetchDriveFiles,
     fetchGithubDirectoryEntries,
     fetchGithubFileContent,
+    fetchGithubFolderFiles,
     fetchGithubRepos,
+    GithubFolderImportEntry,
     getOAuthAuthorizeUrl,
     GoogleDriveEntry,
     GithubEntry,
@@ -12,13 +14,13 @@ import {
     importExternalFile,
     OAuthProvider,
 } from "@/api/externalImportApi"
+import { BACKEND_URL } from "@/config/backend"
 import { useFileSystem } from "@/context/FileContext"
 import useResponsive from "@/hooks/useResponsive"
+import { FileSystemItem } from "@/types/file"
 import { useEffect, useMemo, useState } from "react"
 import toast from "react-hot-toast"
 import { SiGithub, SiGoogledrive } from "react-icons/si"
-
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:3000"
 
 interface OAuthPopupMessage {
     type: "oauth-success" | "oauth-error"
@@ -27,15 +29,77 @@ interface OAuthPopupMessage {
     error?: string
 }
 
+const oauthTokensStorageKey = "external-import-oauth-tokens-v1"
+const oauthProviderStorageKey = "external-import-provider-v1"
+
+const normalizePath = (value: string): string =>
+    value
+        .split("/")
+        .map((segment) => segment.trim())
+        .filter(Boolean)
+        .join("/")
+
+const readStoredOauthTokens = (): Partial<Record<OAuthProvider, string>> => {
+    try {
+        const raw = localStorage.getItem(oauthTokensStorageKey)
+        if (!raw) return {}
+        const parsed = JSON.parse(raw) as Partial<Record<OAuthProvider, unknown>>
+        const tokens: Partial<Record<OAuthProvider, string>> = {}
+        if (typeof parsed.github === "string" && parsed.github.trim()) {
+            tokens.github = parsed.github.trim()
+        }
+        if (typeof parsed.gdrive === "string" && parsed.gdrive.trim()) {
+            tokens.gdrive = parsed.gdrive.trim()
+        }
+        return tokens
+    } catch {
+        return {}
+    }
+}
+
+const readStoredProvider = (): OAuthProvider => {
+    try {
+        const raw = (localStorage.getItem(oauthProviderStorageKey) || "").trim()
+        return raw === "github" ? "github" : "gdrive"
+    } catch {
+        return "gdrive"
+    }
+}
+
+const buildDirectoryPathIndex = (
+    node: FileSystemItem,
+    parentPath = "",
+    index = new Map<string, string>(),
+): Map<string, string> => {
+    if (node.type !== "directory") return index
+
+    const currentPath = normalizePath(parentPath)
+    index.set(currentPath, node.id)
+
+    ;(node.children || []).forEach((child) => {
+        if (child.type !== "directory") return
+        const childPath = normalizePath(
+            currentPath ? `${currentPath}/${child.name}` : child.name,
+        )
+        buildDirectoryPathIndex(child, childPath, index)
+    })
+
+    return index
+}
+
 const ExternalImportView = () => {
     const { viewHeight } = useResponsive()
-    const { fileStructure, importFile } = useFileSystem()
+    const { fileStructure, createDirectory, importFile } = useFileSystem()
     const [activeMode, setActiveMode] = useState<"link" | "account">("link")
     const [externalUrl, setExternalUrl] = useState("")
     const [isImporting, setIsImporting] = useState(false)
     const [lastImportedName, setLastImportedName] = useState<string | null>(null)
-    const [oauthTokens, setOauthTokens] = useState<Partial<Record<OAuthProvider, string>>>({})
-    const [activeAccountProvider, setActiveAccountProvider] = useState<OAuthProvider>("gdrive")
+    const [oauthTokens, setOauthTokens] = useState<Partial<Record<OAuthProvider, string>>>(
+        () => readStoredOauthTokens(),
+    )
+    const [activeAccountProvider, setActiveAccountProvider] = useState<OAuthProvider>(() =>
+        readStoredProvider(),
+    )
 
     const [driveFiles, setDriveFiles] = useState<GoogleDriveEntry[]>([])
     const [isLoadingDriveFiles, setIsLoadingDriveFiles] = useState(false)
@@ -55,25 +119,96 @@ const ExternalImportView = () => {
         }
     }, [])
 
-    const handleImportedPayload = (payload: AccountImportPayload) => {
-        importFile(fileStructure.id, payload.fileName, payload.content, true, {
+    const handleImportedPayload = (
+        payload: AccountImportPayload,
+        parentDirId = fileStructure.id,
+    ) => {
+        importFile(parentDirId, payload.fileName, payload.content, true, {
             contentEncoding: payload.contentEncoding,
             mimeType: payload.mimeType,
+            openInEditor: true,
         })
         setLastImportedName(payload.fileName)
         toast.success(`${payload.fileName} imported to Explorer`)
     }
 
+    const importGithubPayloads = (
+        files: GithubFolderImportEntry[],
+        rootFolderName: string,
+    ) => {
+        const normalizedRootFolderName = rootFolderName.trim() || "github-import"
+        const directoryIndex = buildDirectoryPathIndex(fileStructure)
+        let openedFirstFile = false
+
+        const ensureDirectory = (segments: string[]): string => {
+            let currentPath = ""
+            let parentId = fileStructure.id
+
+            segments.forEach((segmentValue) => {
+                const segment = segmentValue.trim()
+                if (!segment) return
+
+                currentPath = normalizePath(
+                    currentPath ? `${currentPath}/${segment}` : segment,
+                )
+                const existingId = directoryIndex.get(currentPath)
+                if (existingId) {
+                    parentId = existingId
+                    return
+                }
+
+                const createdId = createDirectory(parentId, segment)
+                directoryIndex.set(currentPath, createdId)
+                parentId = createdId
+            })
+
+            return parentId
+        }
+
+        files.forEach((importedFile) => {
+            const normalizedRelativePath = normalizePath(
+                importedFile.relativePath || importedFile.payload.fileName,
+            )
+            const pathSegments = normalizedRelativePath.split("/").filter(Boolean)
+            const fileName =
+                pathSegments.pop() || importedFile.payload.fileName || `file-${Date.now()}`
+            const parentDirectoryId = ensureDirectory([
+                normalizedRootFolderName,
+                ...pathSegments,
+            ])
+
+            const importedId = importFile(
+                parentDirectoryId,
+                fileName,
+                importedFile.payload.content,
+                true,
+                {
+                    contentEncoding: importedFile.payload.contentEncoding,
+                    mimeType: importedFile.payload.mimeType,
+                    openInEditor: !openedFirstFile,
+                },
+            )
+            if (!openedFirstFile && importedId) {
+                openedFirstFile = true
+            }
+        })
+
+        setLastImportedName(normalizedRootFolderName)
+    }
+
     const handleLinkImport = async () => {
         const trimmedUrl = externalUrl.trim()
         if (!trimmedUrl) {
-            toast.error("Paste a Google Drive or GitHub file URL")
+            toast.error("Paste a direct file URL")
             return
         }
 
         try {
             setIsImporting(true)
-            const importedResource = await importExternalFile(trimmedUrl)
+            const importedResource = await importExternalFile(trimmedUrl, {
+                driveAccessToken: oauthTokens.gdrive || "",
+                githubAccessToken: oauthTokens.github || "",
+            })
             const payload: AccountImportPayload = importedResource.isLikelyText
                 ? {
                       fileName: importedResource.fileName,
@@ -131,6 +266,11 @@ const ExternalImportView = () => {
         } catch (error) {
             const message =
                 error instanceof Error ? error.message : "Failed to load Google Drive files."
+            if (/401|unauthorized|invalid credentials/i.test(message)) {
+                setOauthTokens((prevTokens) => ({ ...prevTokens, gdrive: "" }))
+                toast.error("Google Drive session expired. Please login again.")
+                return
+            }
             toast.error(message)
         } finally {
             setIsLoadingDriveFiles(false)
@@ -148,6 +288,11 @@ const ExternalImportView = () => {
         } catch (error) {
             const message =
                 error instanceof Error ? error.message : "Failed to load GitHub repositories."
+            if (/401|unauthorized|invalid credentials/i.test(message)) {
+                setOauthTokens((prevTokens) => ({ ...prevTokens, github: "" }))
+                toast.error("GitHub session expired. Please login again.")
+                return
+            }
             toast.error(message)
         } finally {
             setIsLoadingGithubRepos(false)
@@ -224,6 +369,22 @@ const ExternalImportView = () => {
     }, [backendOrigin])
 
     useEffect(() => {
+        try {
+            localStorage.setItem(oauthTokensStorageKey, JSON.stringify(oauthTokens))
+        } catch {
+            // Ignore storage write failures.
+        }
+    }, [oauthTokens])
+
+    useEffect(() => {
+        try {
+            localStorage.setItem(oauthProviderStorageKey, activeAccountProvider)
+        } catch {
+            // Ignore storage write failures.
+        }
+    }, [activeAccountProvider])
+
+    useEffect(() => {
         const driveToken = oauthTokens.gdrive
         if (!driveToken) return
         void fetchDriveFileList(driveToken)
@@ -295,6 +456,58 @@ const ExternalImportView = () => {
         }
     }
 
+    const handleImportGithubFolder = async ({
+        importPath,
+        importWholeRepo = false,
+    }: {
+        importPath: string
+        importWholeRepo?: boolean
+    }) => {
+        const token = oauthTokens.github
+        if (!token || !selectedGithubRepo) {
+            toast.error("Login to GitHub and select a repository first.")
+            return
+        }
+
+        const normalizedImportPath = normalizePath(importPath)
+
+        try {
+            setIsImporting(true)
+            const folderFiles = await fetchGithubFolderFiles({
+                accessToken: token,
+                owner: selectedGithubRepo.owner.login,
+                repo: selectedGithubRepo.name,
+                path: normalizedImportPath,
+                branch: selectedGithubRepo.default_branch,
+            })
+
+            if (folderFiles.length === 0) {
+                toast.error("No files found in this GitHub folder.")
+                return
+            }
+
+            const folderName = normalizedImportPath
+                ? normalizedImportPath.split("/").pop() || selectedGithubRepo.name
+                : selectedGithubRepo.name
+            const rootFolderName = importWholeRepo
+                ? selectedGithubRepo.name
+                : folderName
+
+            importGithubPayloads(folderFiles, rootFolderName)
+            toast.success(
+                importWholeRepo
+                    ? `${selectedGithubRepo.name} repository imported`
+                    : `${folderName} folder imported`,
+            )
+        } catch (error) {
+            const message =
+                error instanceof Error ? error.message : "Failed to import GitHub folder."
+            toast.error(message)
+        } finally {
+            setIsImporting(false)
+        }
+    }
+
     const handleGithubEntryClick = (entry: GithubEntry) => {
         if (entry.type === "dir") {
             if (!oauthTokens.github || !selectedGithubRepo) return
@@ -357,7 +570,7 @@ const ExternalImportView = () => {
             {activeMode === "link" && (
                 <div className="sidebar-modern-card">
                     <label className="ui-muted-text mb-2 block text-xs">
-                        Keep using direct links from GitHub or Google Drive
+                        Paste a direct file link from Google Drive, GitHub, or any public URL
                     </label>
                     <textarea
                         value={externalUrl}
@@ -512,6 +725,34 @@ const ExternalImportView = () => {
                                         <span className="truncate">
                                             /{githubPath || ""}
                                         </span>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <button
+                                            type="button"
+                                            className="sidebar-modern-btn px-2 py-1 text-xs"
+                                            onClick={() => {
+                                                void handleImportGithubFolder({
+                                                    importPath: githubPath,
+                                                    importWholeRepo: false,
+                                                })
+                                            }}
+                                            disabled={isImporting || isLoadingGithubEntries}
+                                        >
+                                            {isImporting ? "Importing..." : "Import This Folder"}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            className="sidebar-modern-btn px-2 py-1 text-xs"
+                                            onClick={() => {
+                                                void handleImportGithubFolder({
+                                                    importPath: "",
+                                                    importWholeRepo: true,
+                                                })
+                                            }}
+                                            disabled={isImporting || isLoadingGithubEntries}
+                                        >
+                                            {isImporting ? "Importing..." : "Import Whole Repo"}
+                                        </button>
                                     </div>
 
                                     <div className="max-h-80 overflow-auto rounded-xl border border-slate-500/30 bg-slate-900/60">

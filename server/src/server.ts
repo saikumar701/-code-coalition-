@@ -8,6 +8,7 @@ import { Server } from "socket.io"
 import path from "path"
 import * as pty from "node-pty"
 import os from "os"
+import net from "net"
 import fs from "fs"
 import fsPromises from "fs/promises"
 import { randomBytes } from "crypto"
@@ -17,6 +18,13 @@ import {
 	loadRoomSnapshot,
 	saveRoomSnapshot,
 } from "./services/roomSnapshotStore"
+import {
+	getProjectRunnerLogs,
+	getProjectRunnerStatus,
+	resolvePreviewTarget,
+	startProjectRunnerSession,
+	stopProjectRunnerSession,
+} from "./services/projectRunner"
 
 const loadServerEnv = () => {
 	const envPaths = [
@@ -33,8 +41,10 @@ loadServerEnv()
 void initializeRoomSnapshotStore()
 
 const app = express()
+const jsonBodyLimit = (process.env.JSON_BODY_LIMIT || "80mb").trim() || "80mb"
 
-app.use(express.json())
+app.use(express.json({ limit: jsonBodyLimit }))
+app.use(express.urlencoded({ limit: jsonBodyLimit, extended: true }))
 
 app.use(cors())
 
@@ -57,8 +67,10 @@ const isWorkspaceDiskSyncEnabled =
 const workspaceRoot = isWorkspaceDiskSyncEnabled
 	? path.resolve(process.cwd(), ".workspaces")
 	: path.join(os.tmpdir(), "code-coalition-workspaces")
+const runnerWorkspaceRoot = path.join(workspaceRoot, "__runner_sessions")
 const roomFileTrees = new Map<string, WorkspaceFileSystemItem>()
 const roomTrackedPaths = new Map<string, Set<string>>()
+const roomRunnerWorkspacePaths = new Map<string, string>()
 const roomSyncTimers = new Map<string, NodeJS.Timeout>()
 const roomScreenShareMap = new Map<string, ScreenShareInfo>()
 const roomAdminSocketMap = new Map<string, SocketId>()
@@ -81,7 +93,6 @@ const oauthStateStore = new Map<string, OAuthStateRecord>()
 const oauthStateTtlMs = 10 * 60 * 1000
 const googleDriveScope = "https://www.googleapis.com/auth/drive.readonly"
 const githubScope = "repo read:user"
-const defaultPistonApiBaseUrl = "http://localhost:2000/api/v2/piston"
 const localRunTimeoutMs = 15000
 const localFallbackRuntimes: PistonRuntime[] = [
 	{
@@ -338,12 +349,103 @@ function getWorkspaceEntries(children: WorkspaceFileSystemItem[], parentPath = "
 	return entries
 }
 
-async function synchronizeWorkspaceToDisk(roomId: string): Promise<void> {
+async function removePathWithRetries(
+	targetPath: string,
+	maxAttempts = 4,
+): Promise<void> {
+	let attempt = 0
+	while (attempt < maxAttempts) {
+		try {
+			await fsPromises.rm(targetPath, { recursive: true, force: true })
+			return
+		} catch (error) {
+			attempt += 1
+			const errorCode = (error as NodeJS.ErrnoException).code || ""
+			const isRetryable =
+				errorCode === "EBUSY" || errorCode === "EPERM" || errorCode === "ENOTEMPTY"
+			if (!isRetryable || attempt >= maxAttempts) {
+				throw error
+			}
+			await new Promise((resolve) => setTimeout(resolve, 120 * attempt))
+		}
+	}
+}
+
+async function clearWorkspaceDirectoryContents(workspacePath: string): Promise<void> {
+	await fsPromises.mkdir(workspacePath, { recursive: true })
+	const childEntries = await fsPromises.readdir(workspacePath).catch(() => [])
+	for (const childEntry of childEntries) {
+		const childPath = path.join(workspacePath, childEntry)
+		await removePathWithRetries(childPath)
+	}
+}
+
+async function writeWorkspaceEntriesToPath(
+	workspacePath: string,
+	entries: WorkspaceEntry[],
+): Promise<void> {
+	const directoryEntries = entries
+		.filter((entry) => entry.type === "directory")
+		.sort((a, b) => a.relativePath.split("/").length - b.relativePath.split("/").length)
+
+	for (const directory of directoryEntries) {
+		const absolutePath = path.join(workspacePath, ...directory.relativePath.split("/"))
+		await fsPromises.mkdir(absolutePath, { recursive: true })
+	}
+
+	const fileEntries = entries.filter((entry) => entry.type === "file")
+	for (const fileEntry of fileEntries) {
+		const absolutePath = path.join(workspacePath, ...fileEntry.relativePath.split("/"))
+		await fsPromises.mkdir(path.dirname(absolutePath), { recursive: true })
+		if (fileEntry.contentEncoding === "base64") {
+			const fileBuffer = Buffer.from(fileEntry.content || "", "base64")
+			await fsPromises.writeFile(absolutePath, Uint8Array.from(fileBuffer))
+		} else {
+			await fsPromises.writeFile(absolutePath, fileEntry.content || "", "utf8")
+		}
+	}
+}
+
+async function createRunnerWorkspaceSnapshot(
+	roomId: string,
+	fileTree: WorkspaceFileSystemItem,
+): Promise<string> {
+	const roomRunnerRoot = path.join(runnerWorkspaceRoot, sanitizeRoomId(roomId))
+	const snapshotDirectoryName = `${Date.now()}-${randomBytes(4).toString("hex")}`
+	const snapshotPath = path.join(roomRunnerRoot, snapshotDirectoryName)
+	const entries = getWorkspaceEntries(fileTree.children || [])
+
+	await fsPromises.mkdir(snapshotPath, { recursive: true })
+	await writeWorkspaceEntriesToPath(snapshotPath, entries)
+	return snapshotPath
+}
+
+async function cleanupRunnerWorkspace(roomId: string): Promise<void> {
+	const runnerWorkspacePath = roomRunnerWorkspacePaths.get(roomId)
+	if (!runnerWorkspacePath) return
+
+	roomRunnerWorkspacePaths.delete(roomId)
+	await removePathWithRetries(runnerWorkspacePath).catch((error) => {
+		console.warn(
+			`Failed to cleanup runner workspace for room ${roomId}:`,
+			(error as Error).message,
+		)
+	})
+}
+
+async function synchronizeWorkspaceToDisk(
+	roomId: string,
+	forceClean = false,
+): Promise<void> {
 	const fileTree = roomFileTrees.get(roomId)
 	if (!fileTree || fileTree.type !== "directory") return
 	await saveRoomSnapshot(roomId, fileTree)
 
 	const workspacePath = getRoomWorkspacePath(roomId)
+	if (forceClean) {
+		await clearWorkspaceDirectoryContents(workspacePath)
+		roomTrackedPaths.delete(roomId)
+	}
 	const nextEntries = getWorkspaceEntries(fileTree.children || [])
 	const nextPaths = new Set(nextEntries.map((entry) => entry.relativePath))
 	const previousPaths = roomTrackedPaths.get(roomId) || new Set<string>()
@@ -359,26 +461,7 @@ async function synchronizeWorkspaceToDisk(roomId: string): Promise<void> {
 		await fsPromises.rm(absolutePath, { recursive: true, force: true })
 	}
 
-	const directoryEntries = nextEntries
-		.filter((entry) => entry.type === "directory")
-		.sort((a, b) => a.relativePath.split("/").length - b.relativePath.split("/").length)
-
-	for (const directory of directoryEntries) {
-		const absolutePath = path.join(workspacePath, ...directory.relativePath.split("/"))
-		await fsPromises.mkdir(absolutePath, { recursive: true })
-	}
-
-	const fileEntries = nextEntries.filter((entry) => entry.type === "file")
-	for (const fileEntry of fileEntries) {
-		const absolutePath = path.join(workspacePath, ...fileEntry.relativePath.split("/"))
-		await fsPromises.mkdir(path.dirname(absolutePath), { recursive: true })
-		if (fileEntry.contentEncoding === "base64") {
-			const fileBuffer = Buffer.from(fileEntry.content || "", "base64")
-			await fsPromises.writeFile(absolutePath, Uint8Array.from(fileBuffer))
-		} else {
-			await fsPromises.writeFile(absolutePath, fileEntry.content || "", "utf8")
-		}
-	}
+	await writeWorkspaceEntriesToPath(workspacePath, nextEntries)
 
 	roomTrackedPaths.set(roomId, nextPaths)
 }
@@ -647,6 +730,12 @@ function sanitizeImportedFileName(fileName: string): string {
 	return cleaned || `imported-file-${Date.now()}`
 }
 
+function toTextSnapshotFileName(fileName: string): string {
+	const sanitized = sanitizeImportedFileName(fileName || `imported-page-${Date.now()}`)
+	const baseName = sanitized.replace(/\.[^./\\]+$/, "")
+	return `${baseName}.snapshot.txt`
+}
+
 function getFileNameFromPath(pathname: string): string {
 	const parts = pathname.split("/").filter(Boolean)
 	const lastPart = parts[parts.length - 1] || ""
@@ -659,9 +748,31 @@ function getFileNameFromPath(pathname: string): string {
 	}
 }
 
+type DriveLinkKind =
+	| "file"
+	| "document"
+	| "spreadsheet"
+	| "presentation"
+	| "drawing"
+	| "form"
+	| "unknown"
+
+type ExternalImportProvider = "github" | "gdrive" | "direct"
+
+interface DriveLinkInfo {
+	fileId: string
+	resourceKey: string
+	kind: DriveLinkKind
+}
+
 function extractDriveFileId(urlValue: string): string | null {
 	const directMatch = urlValue.match(/\/file\/d\/([a-zA-Z0-9_-]+)/)
 	if (directMatch?.[1]) return directMatch[1]
+
+	const docsMatch = urlValue.match(
+		/\/(?:document|spreadsheets|presentation|drawings|forms)\/d\/([a-zA-Z0-9_-]+)/,
+	)
+	if (docsMatch?.[1]) return docsMatch[1]
 
 	const openMatch = urlValue.match(/[?&]id=([a-zA-Z0-9_-]+)/)
 	if (openMatch?.[1]) return openMatch[1]
@@ -670,6 +781,204 @@ function extractDriveFileId(urlValue: string): string | null {
 	if (ucMatch?.[1]) return ucMatch[1]
 
 	return null
+}
+
+function detectDriveLinkKind(parsedUrl: URL): DriveLinkKind {
+	const host = parsedUrl.hostname.toLowerCase()
+	const pathname = parsedUrl.pathname.toLowerCase()
+	if (
+		host.endsWith("drive.google.com") ||
+		host === "drive.usercontent.google.com"
+	) {
+		return "file"
+	}
+	if (!host.endsWith("docs.google.com")) {
+		return "unknown"
+	}
+	if (pathname.startsWith("/document/d/")) return "document"
+	if (pathname.startsWith("/spreadsheets/d/")) return "spreadsheet"
+	if (pathname.startsWith("/presentation/d/")) return "presentation"
+	if (pathname.startsWith("/drawings/d/")) return "drawing"
+	if (pathname.startsWith("/forms/d/")) return "form"
+	return "unknown"
+}
+
+function extractDriveLinkInfo(parsedUrl: URL, rawUrl: string): DriveLinkInfo | null {
+	const fileId = extractDriveFileId(rawUrl)
+	if (!fileId) return null
+	const resourceKey = (parsedUrl.searchParams.get("resourcekey") || "").trim()
+	const kind = detectDriveLinkKind(parsedUrl)
+	return {
+		fileId,
+		resourceKey,
+		kind,
+	}
+}
+
+function buildDriveDownloadUrl(info: DriveLinkInfo): string {
+	const { fileId, resourceKey, kind } = info
+	const url =
+		kind === "document"
+			? new URL(`https://docs.google.com/document/d/${fileId}/export`)
+			: kind === "spreadsheet"
+				? new URL(`https://docs.google.com/spreadsheets/d/${fileId}/export`)
+				: kind === "presentation"
+					? new URL(`https://docs.google.com/presentation/d/${fileId}/export/pptx`)
+					: kind === "drawing"
+						? new URL(`https://docs.google.com/drawings/d/${fileId}/export`)
+						: new URL("https://drive.google.com/uc")
+
+	if (kind === "document") {
+		url.searchParams.set("format", "txt")
+	} else if (kind === "spreadsheet") {
+		url.searchParams.set("format", "csv")
+	} else if (kind === "drawing") {
+		url.searchParams.set("format", "png")
+	} else if (kind === "file" || kind === "unknown" || kind === "form") {
+		url.searchParams.set("export", "download")
+		url.searchParams.set("id", fileId)
+	}
+
+	if (resourceKey) {
+		url.searchParams.set("resourcekey", resourceKey)
+	}
+
+	return url.toString()
+}
+
+function getDriveFileNameFallback(fileId: string, kind: DriveLinkKind): string {
+	if (kind === "document") return `drive-document-${fileId}.txt`
+	if (kind === "spreadsheet") return `drive-sheet-${fileId}.csv`
+	if (kind === "presentation") return `drive-presentation-${fileId}.pptx`
+	if (kind === "drawing") return `drive-drawing-${fileId}.png`
+	return `drive-file-${fileId}`
+}
+
+function buildDriveAnonymousFallbackUrls(params: {
+	fileId: string
+	resourceKey: string
+}): string[] {
+	const { fileId, resourceKey } = params
+	const urls: string[] = []
+
+	const driveUserContentUrl = new URL("https://drive.usercontent.google.com/download")
+	driveUserContentUrl.searchParams.set("id", fileId)
+	driveUserContentUrl.searchParams.set("export", "download")
+	driveUserContentUrl.searchParams.set("confirm", "t")
+	if (resourceKey) {
+		driveUserContentUrl.searchParams.set("resourcekey", resourceKey)
+	}
+	urls.push(driveUserContentUrl.toString())
+
+	const driveUcUrl = new URL("https://drive.google.com/uc")
+	driveUcUrl.searchParams.set("export", "download")
+	driveUcUrl.searchParams.set("id", fileId)
+	driveUcUrl.searchParams.set("confirm", "t")
+	if (resourceKey) {
+		driveUcUrl.searchParams.set("resourcekey", resourceKey)
+	}
+	urls.push(driveUcUrl.toString())
+
+	return urls
+}
+
+function getDriveExportMimeType(nativeMimeType: string): string | null {
+	const normalizedMimeType = nativeMimeType.trim().toLowerCase()
+	if (normalizedMimeType === "application/vnd.google-apps.document") return "text/plain"
+	if (normalizedMimeType === "application/vnd.google-apps.spreadsheet") return "text/csv"
+	if (normalizedMimeType === "application/vnd.google-apps.presentation") {
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+	}
+	if (normalizedMimeType === "application/vnd.google-apps.drawing") return "image/png"
+	return null
+}
+
+async function tryDownloadDriveFileWithAccessToken(params: {
+	fileId: string
+	accessToken: string
+}): Promise<{ buffer: Buffer; mimeType: string; fileName: string } | null> {
+	const fileId = params.fileId.trim()
+	const accessToken = params.accessToken.trim()
+	if (!fileId || !accessToken) return null
+
+	const authHeaders = {
+		Authorization: `Bearer ${accessToken}`,
+	}
+	const encodedFileId = encodeURIComponent(fileId)
+	const metadataUrl = new URL(`https://www.googleapis.com/drive/v3/files/${encodedFileId}`)
+	metadataUrl.searchParams.set("fields", "id,name,mimeType,size")
+	metadataUrl.searchParams.set("supportsAllDrives", "true")
+
+	try {
+		const metadataResponse = await fetch(metadataUrl.toString(), {
+			method: "GET",
+			headers: authHeaders,
+		})
+		if (!metadataResponse.ok) {
+			return null
+		}
+
+		const metadataPayload = (await metadataResponse.json().catch(() => null)) as
+			| {
+					name?: string
+					mimeType?: string
+			  }
+			| null
+		if (!metadataPayload) return null
+
+		const fileName = sanitizeImportedFileName(
+			typeof metadataPayload.name === "string" ? metadataPayload.name : `drive-file-${fileId}`,
+		)
+		const sourceMimeType =
+			typeof metadataPayload.mimeType === "string"
+				? metadataPayload.mimeType.trim()
+				: "application/octet-stream"
+		const exportMimeType = getDriveExportMimeType(sourceMimeType)
+
+		let fileResponse: globalThis.Response
+		let expectedMimeType = sourceMimeType
+		if (exportMimeType) {
+			const exportUrl = new URL(
+				`https://www.googleapis.com/drive/v3/files/${encodedFileId}/export`,
+			)
+			exportUrl.searchParams.set("mimeType", exportMimeType)
+			fileResponse = await fetch(exportUrl.toString(), {
+				method: "GET",
+				headers: authHeaders,
+			})
+			expectedMimeType = exportMimeType
+		} else {
+			const mediaUrl = new URL(`https://www.googleapis.com/drive/v3/files/${encodedFileId}`)
+			mediaUrl.searchParams.set("alt", "media")
+			mediaUrl.searchParams.set("supportsAllDrives", "true")
+			fileResponse = await fetch(mediaUrl.toString(), {
+				method: "GET",
+				headers: authHeaders,
+			})
+		}
+
+		if (!fileResponse.ok) {
+			return null
+		}
+
+		const buffer = Buffer.from(await fileResponse.arrayBuffer())
+		if (buffer.length === 0) {
+			return null
+		}
+
+		const mimeType =
+			(fileResponse.headers.get("content-type") || expectedMimeType || "application/octet-stream")
+				.split(";")[0]
+				.trim() || "application/octet-stream"
+
+		return {
+			buffer,
+			mimeType,
+			fileName,
+		}
+	} catch {
+		return null
+	}
 }
 
 function getGithubRawUrl(inputUrl: URL): string | null {
@@ -713,6 +1022,310 @@ function isLikelyTextFile(mimeType: string, buffer: Buffer): boolean {
 	)
 }
 
+function extractGoogleDriveConfirmToken(html: string): string | null {
+	if (!html) return null
+
+	const hrefMatch = html.match(/confirm=([0-9A-Za-z_-]+)&(?:amp;)?id=/i)
+	if (hrefMatch?.[1]) {
+		return hrefMatch[1]
+	}
+
+	const inputMatch = html.match(/name=["']confirm["']\s+value=["']([^"']+)["']/i)
+	if (inputMatch?.[1]) {
+		return inputMatch[1]
+	}
+
+	return null
+}
+
+function decodeBasicHtmlEntities(value: string): string {
+	return value
+		.replace(/&amp;/gi, "&")
+		.replace(/&#x3d;/gi, "=")
+		.replace(/&#61;/gi, "=")
+		.replace(/&#x2f;/gi, "/")
+}
+
+function decodeUriComponentSafe(value: string): string {
+	try {
+		return decodeURIComponent(value)
+	} catch {
+		return value
+	}
+}
+
+function decodeHtmlEntitiesForText(value: string): string {
+	const withNamedEntities = decodeBasicHtmlEntities(value)
+		.replace(/&nbsp;/gi, " ")
+		.replace(/&lt;/gi, "<")
+		.replace(/&gt;/gi, ">")
+		.replace(/&quot;/gi, '"')
+		.replace(/&#39;/gi, "'")
+	return withNamedEntities
+		.replace(/&#(\d+);/g, (_fullMatch, codePointValue: string) => {
+			const codePoint = Number(codePointValue)
+			if (!Number.isFinite(codePoint)) return ""
+			try {
+				return String.fromCodePoint(codePoint)
+			} catch {
+				return ""
+			}
+		})
+		.replace(/&#x([0-9a-f]+);/gi, (_fullMatch, codePointValue: string) => {
+			const codePoint = Number.parseInt(codePointValue, 16)
+			if (!Number.isFinite(codePoint)) return ""
+			try {
+				return String.fromCodePoint(codePoint)
+			} catch {
+				return ""
+			}
+		})
+}
+
+function extractReadableTextFromHtml(html: string): string[] {
+	if (!html.trim()) return ["Empty HTML page."]
+
+	const withoutScripts = html
+		.replace(/<script[\s\S]*?<\/script>/gi, " ")
+		.replace(/<style[\s\S]*?<\/style>/gi, " ")
+		.replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+
+	const withLineBreakHints = withoutScripts.replace(
+		/<\/?(p|div|section|article|header|footer|main|aside|h[1-6]|li|tr|td|th|pre|code|br|hr)[^>]*>/gi,
+		"\n",
+	)
+	const textOnly = withLineBreakHints.replace(/<[^>]+>/g, " ")
+	const decodedText = decodeHtmlEntitiesForText(textOnly)
+
+	const lines = decodedText
+		.split(/\r?\n/)
+		.map((line) => line.replace(/\s+/g, " ").trim())
+		.filter(Boolean)
+
+	return lines.length > 0 ? lines : ["HTML page content could not be parsed."]
+}
+
+function buildHtmlSnapshotText(params: {
+	html: string
+	sourceUrl: string
+	fileNameHint: string
+	authPageDetected: boolean
+}): { buffer: Buffer; mimeType: string; fileName: string } {
+	const { html, sourceUrl, fileNameHint, authPageDetected } = params
+	const allLines = extractReadableTextFromHtml(html)
+	const maxLines = 300
+	const maxCharsPerLine = 180
+	const clippedLines = allLines
+		.slice(0, maxLines)
+		.map((line) =>
+			line.length > maxCharsPerLine ? `${line.slice(0, maxCharsPerLine - 3)}...` : line,
+		)
+
+	const headerLines: string[] = [
+		"External HTML page snapshot",
+		`Source: ${sourceUrl}`,
+		"",
+	]
+	if (authPageDetected) {
+		headerLines.push(
+			"Note: This page looks like a login/auth page, not a directly downloadable file.",
+			"",
+		)
+	}
+	const snapshotText = [...headerLines, ...clippedLines].join("\n")
+
+	return {
+		buffer: Buffer.from(snapshotText, "utf8"),
+		mimeType: "text/plain",
+		fileName: toTextSnapshotFileName(fileNameHint),
+	}
+}
+
+function tryGetDirectAssetUrlFromPageUrl(pageUrl: string): string | null {
+	let parsedPageUrl: URL
+	try {
+		parsedPageUrl = new URL(pageUrl)
+	} catch {
+		return null
+	}
+
+	const candidateParamNames = [
+		"imgurl",
+		"mediaurl",
+		"file",
+		"download",
+		"url",
+		"u",
+		"continue",
+		"followup",
+		"continue_url",
+		"dest",
+	]
+	for (const paramName of candidateParamNames) {
+		const rawValue = (parsedPageUrl.searchParams.get(paramName) || "").trim()
+		if (!rawValue) continue
+
+		const decodedValue = decodeUriComponentSafe(rawValue)
+		const decodedTwiceValue = decodeUriComponentSafe(decodedValue)
+		const candidateValues = [rawValue, decodedValue, decodedTwiceValue]
+		for (const candidateValue of candidateValues) {
+			try {
+				const candidateUrl = new URL(candidateValue)
+				if (!["http:", "https:"].includes(candidateUrl.protocol)) {
+					continue
+				}
+				if (candidateUrl.toString() === parsedPageUrl.toString()) {
+					continue
+				}
+				return candidateUrl.toString()
+			} catch {
+				// Ignore invalid candidate values.
+			}
+		}
+	}
+
+	return null
+}
+
+function enrichDriveDownloadUrl(params: {
+	urlValue: string
+	baseUrl: string
+	fileId: string
+	resourceKey: string
+}): string | null {
+	const { urlValue, baseUrl, fileId, resourceKey } = params
+	try {
+		const url = new URL(decodeBasicHtmlEntities(urlValue), baseUrl)
+		if (!url.searchParams.get("id")) {
+			url.searchParams.set("id", fileId)
+		}
+		if (resourceKey && !url.searchParams.get("resourcekey")) {
+			url.searchParams.set("resourcekey", resourceKey)
+		}
+		return url.toString()
+	} catch {
+		return null
+	}
+}
+
+function extractGoogleDriveFollowUpUrl(params: {
+	html: string
+	baseUrl: string
+	fileId: string
+	resourceKey: string
+}): string | null {
+	const { html, baseUrl, fileId, resourceKey } = params
+	if (!html) return null
+
+	const hrefPatterns = [
+		/href=["']([^"']*drive\.usercontent\.google\.com\/download[^"']*)["']/i,
+		/href=["']([^"']*\/uc\?[^"']*export=download[^"']*)["']/i,
+		/href=["']([^"']*confirm=[^"']*id=[^"']*)["']/i,
+	]
+
+	for (const hrefPattern of hrefPatterns) {
+		const hrefMatch = html.match(hrefPattern)
+		if (!hrefMatch?.[1]) continue
+		const followUpUrl = enrichDriveDownloadUrl({
+			urlValue: hrefMatch[1],
+			baseUrl,
+			fileId,
+			resourceKey,
+		})
+		if (followUpUrl) return followUpUrl
+	}
+
+	const formMatch = html.match(/<form[^>]*action=["']([^"']+)["'][^>]*>([\s\S]*?)<\/form>/i)
+	if (!formMatch?.[1]) return null
+
+	const actionUrl = enrichDriveDownloadUrl({
+		urlValue: formMatch[1],
+		baseUrl,
+		fileId,
+		resourceKey,
+	})
+	if (!actionUrl) return null
+
+	const url = new URL(actionUrl)
+	const formHtml = formMatch[2] || ""
+	const inputRegex = /<input[^>]*name=["']([^"']+)["'][^>]*value=["']([^"']*)["'][^>]*>/gi
+	let inputMatch: RegExpExecArray | null = null
+	while ((inputMatch = inputRegex.exec(formHtml)) !== null) {
+		const name = (inputMatch[1] || "").trim()
+		if (!name) continue
+		const value = decodeBasicHtmlEntities(inputMatch[2] || "")
+		url.searchParams.set(name, value)
+	}
+
+	if (!url.searchParams.get("id")) {
+		url.searchParams.set("id", fileId)
+	}
+	if (resourceKey && !url.searchParams.get("resourcekey")) {
+		url.searchParams.set("resourcekey", resourceKey)
+	}
+
+	return url.toString()
+}
+
+function isHtmlAuthPageResponse(params: {
+	provider: ExternalImportProvider
+	mimeType: string
+	buffer: Buffer
+	finalUrl: string
+}): boolean {
+	const { provider, mimeType, buffer, finalUrl } = params
+	const looksLikeHtml = mimeType.toLowerCase() === "text/html"
+	if (!looksLikeHtml) return false
+
+	const sampleText = buffer
+		.subarray(0, Math.min(buffer.length, 4096))
+		.toString("utf8")
+		.toLowerCase()
+
+	const hasHtmlMarkers = sampleText.includes("<html") || sampleText.includes("<!doctype html")
+	if (!hasHtmlMarkers) return false
+
+	const finalHost = (() => {
+		try {
+			return new URL(finalUrl).hostname.toLowerCase()
+		} catch {
+			return ""
+		}
+	})()
+
+	if (provider === "gdrive") {
+		const looksLikeGoogleSignInPage =
+			sampleText.includes("accounts.google.com") ||
+			sampleText.includes("servicelogin") ||
+			sampleText.includes("identifierid") ||
+			sampleText.includes("sign in to continue") ||
+			sampleText.includes("to continue to google")
+		if (
+			finalHost.includes("accounts.google.com") ||
+			looksLikeGoogleSignInPage
+		) {
+			return true
+		}
+	}
+
+	if (provider === "github") {
+		const looksLikeGitHubSignInPage =
+			sampleText.includes("github") &&
+			(sampleText.includes("sign in") ||
+				sampleText.includes("login") ||
+				sampleText.includes("session"))
+		if (
+			finalHost === "github.com" ||
+			finalHost.endsWith(".github.com") ||
+			looksLikeGitHubSignInPage
+		) {
+			return true
+		}
+	}
+
+	return false
+}
+
 function normalizeOrigin(originValue: string | null | undefined): string {
 	if (!originValue) return ""
 
@@ -737,6 +1350,135 @@ function getServerPublicBaseUrl(req: Request): string {
 	return `${protocol}://${host}`
 }
 
+function getDirectPreviewUrl(req: Request, port: number): string {
+	const hostName =
+		(typeof req.headers["x-forwarded-host"] === "string"
+			? req.headers["x-forwarded-host"]
+			: req.hostname || "localhost")
+			.split(",")[0]
+			.trim()
+			.replace(/:\d+$/, "")
+
+	return `http://${hostName}:${port}/`
+}
+
+function isWorkspaceDirectory(value: unknown): value is WorkspaceFileSystemItem {
+	if (!value || typeof value !== "object") return false
+	const maybeItem = value as Partial<WorkspaceFileSystemItem>
+	return maybeItem.type === "directory" && typeof maybeItem.id === "string"
+}
+
+function proxyPreviewRequest(req: Request, res: Response, roomId: string, port: number) {
+	const upstreamPath = req.url && req.url.trim().length > 0 ? req.url : "/"
+	const requestHeaders: http.OutgoingHttpHeaders = {
+		...req.headers,
+		host: `127.0.0.1:${port}`,
+	}
+
+	const proxyReq = http.request(
+		{
+			hostname: "127.0.0.1",
+			port,
+			method: req.method,
+			path: upstreamPath,
+			headers: requestHeaders,
+		},
+		(proxyRes) => {
+			const responseHeaders: http.OutgoingHttpHeaders = {
+				...proxyRes.headers,
+			}
+			delete responseHeaders["x-frame-options"]
+
+			const locationHeader = responseHeaders.location
+			if (typeof locationHeader === "string" && locationHeader.startsWith("/")) {
+				responseHeaders.location = `/preview/${encodeURIComponent(roomId)}${locationHeader}`
+			}
+
+			res.writeHead(proxyRes.statusCode || 502, responseHeaders)
+			proxyRes.pipe(res)
+		},
+	)
+
+	proxyReq.on("error", (error) => {
+		if (res.headersSent) {
+			res.end()
+			return
+		}
+		res.status(502).json({
+			error: `Preview proxy error: ${(error as Error).message}`,
+		})
+	})
+
+	req.pipe(proxyReq)
+}
+
+function proxyPreviewUpgrade(
+	req: http.IncomingMessage,
+	socket: any,
+	head: Buffer,
+): boolean {
+	const requestUrl = req.url || ""
+	const parsedUrl = new URL(requestUrl, "http://localhost")
+	const previewPathMatch = parsedUrl.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/)
+	if (!previewPathMatch) {
+		return false
+	}
+
+	const roomId = decodeURIComponent(previewPathMatch[1] || "").trim()
+	if (!roomId) {
+		socket.destroy()
+		return true
+	}
+
+	const target = resolvePreviewTarget(roomId)
+	if (!target) {
+		socket.destroy()
+		return true
+	}
+
+	const proxyPath = `${previewPathMatch[2] || "/"}${parsedUrl.search || ""}`
+	const upstreamSocket = net.createConnection({
+		host: "127.0.0.1",
+		port: target.port,
+	})
+
+	upstreamSocket.on("connect", () => {
+		const forwardedHeaders = Object.entries(req.headers)
+			.filter(([headerName]) => headerName.toLowerCase() !== "host")
+			.map(([headerName, value]) => {
+				const normalizedValue = Array.isArray(value)
+					? value.join(", ")
+					: value || ""
+				return `${headerName}: ${normalizedValue}`
+			})
+			.join("\r\n")
+		const upgradeRequestLines = [
+			`${req.method || "GET"} ${proxyPath} HTTP/1.1`,
+			`Host: 127.0.0.1:${target.port}`,
+		]
+		if (forwardedHeaders) {
+			upgradeRequestLines.push(forwardedHeaders)
+		}
+		upgradeRequestLines.push("", "")
+		const upgradeRequest = upgradeRequestLines.join("\r\n")
+
+		upstreamSocket.write(upgradeRequest)
+		if (head?.length) {
+			upstreamSocket.write(head)
+		}
+		socket.pipe(upstreamSocket).pipe(socket)
+	})
+
+	upstreamSocket.on("error", () => {
+		socket.destroy()
+	})
+	socket.on("error", () => {
+		upstreamSocket.destroy()
+	})
+
+	return true
+}
+
 function buildOAuthRedirectUri(req: Request, provider: OAuthProvider): string {
 	const serverBaseUrl = getServerPublicBaseUrl(req)
 	const pathSuffix = provider === "github" ? "github" : "gdrive"
@@ -744,9 +1486,8 @@ function buildOAuthRedirectUri(req: Request, provider: OAuthProvider): string {
 }
 
 function getPistonApiBaseUrl(): string {
-	const configuredBaseUrl = (
-		process.env.PISTON_API_BASE_URL || defaultPistonApiBaseUrl
-	).trim()
+	const configuredBaseUrl = (process.env.PISTON_API_BASE_URL || "").trim()
+	if (!configuredBaseUrl) return ""
 	return configuredBaseUrl.replace(/\/+$/, "")
 }
 
@@ -1308,6 +2049,14 @@ io.on("connection", (socket) => {
 					roomId,
 					"Room was closed because the admin is no longer connected.",
 				)
+				stopProjectRunnerSession(roomId)
+				void cleanupRunnerWorkspace(roomId)
+				const latestRoomTree = roomFileTrees.get(roomId)
+				if (latestRoomTree && latestRoomTree.type === "directory") {
+					void saveRoomSnapshot(roomId, latestRoomTree).catch((error) => {
+						console.error(`Failed to persist final snapshot for room ${roomId}:`, error)
+					})
+				}
 				roomAdminSocketMap.delete(roomId)
 				approvedRoomSessions.delete(roomId)
 				roomScreenShareMap.delete(roomId)
@@ -1951,6 +2700,10 @@ app.get("/api/piston/runtimes", async (_req: Request, res: Response) => {
 	try {
 		loadServerEnv()
 		const pistonApiBaseUrl = getPistonApiBaseUrl()
+		if (!pistonApiBaseUrl) {
+			return res.json(localFallbackRuntimes)
+		}
+
 		const upstreamResponse = await fetch(`${pistonApiBaseUrl}/runtimes`, {
 			method: "GET",
 			headers: {
@@ -1979,9 +2732,11 @@ app.post("/api/piston/execute", async (req: Request, res: Response) => {
 	const executeBody = (req.body || {}) as PistonExecuteBody
 	let upstreamErrorMessage = ""
 
-	try {
-		loadServerEnv()
-		const pistonApiBaseUrl = getPistonApiBaseUrl()
+	loadServerEnv()
+	const pistonApiBaseUrl = getPistonApiBaseUrl()
+
+	if (pistonApiBaseUrl) {
+		try {
 		const upstreamResponse = await fetch(`${pistonApiBaseUrl}/execute`, {
 			method: "POST",
 			headers: {
@@ -2000,8 +2755,9 @@ app.post("/api/piston/execute", async (req: Request, res: Response) => {
 		} else {
 			return res.json(data)
 		}
-	} catch (error) {
-		upstreamErrorMessage = `Piston execute proxy error: ${(error as Error).message}`
+		} catch (error) {
+			upstreamErrorMessage = `Piston execute proxy error: ${(error as Error).message}`
+		}
 	}
 
 	const localExecution = await executeWithLocalRuntime(executeBody)
@@ -2017,6 +2773,118 @@ app.post("/api/piston/execute", async (req: Request, res: Response) => {
 	}
 
 	return res.status(400).json({ error: fallbackError })
+})
+
+app.post("/api/runner/start", async (req: Request, res: Response) => {
+	try {
+		const roomId =
+			typeof req.body?.roomId === "string" ? req.body.roomId.trim() : ""
+		if (!roomId) {
+			return res.status(400).json({ error: "roomId is required." })
+		}
+		// Always stop any previous run first so a failed start does not keep stale apps alive.
+		stopProjectRunnerSession(roomId)
+
+		const incomingFileStructure = req.body?.fileStructure
+		if (!isWorkspaceDirectory(incomingFileStructure)) {
+			return res.status(400).json({
+				error: "fileStructure is required and must be a directory payload.",
+			})
+		}
+		roomFileTrees.set(roomId, incomingFileStructure)
+		const preferredProjectPath =
+			typeof req.body?.preferredProjectPath === "string"
+				? req.body.preferredProjectPath.trim()
+				: ""
+
+		const pendingSyncTimer = roomSyncTimers.get(roomId)
+		if (pendingSyncTimer) {
+			clearTimeout(pendingSyncTimer)
+			roomSyncTimers.delete(roomId)
+		}
+
+		const latestRoomTree = roomFileTrees.get(roomId)
+		if (!latestRoomTree || latestRoomTree.type !== "directory") {
+			return res.status(409).json({
+				error: "Workspace is not synced yet. Save files or wait a second, then press Run again.",
+			})
+		}
+
+		await synchronizeWorkspaceToDisk(roomId)
+		const roomWorkspacePath = getRoomWorkspacePath(roomId)
+
+		const runnerResult = await startProjectRunnerSession({
+			roomId,
+			workspacePath: roomWorkspacePath,
+			preferredProjectPath,
+		})
+		const previewProxyUrl = `${getServerPublicBaseUrl(req)}/preview/${encodeURIComponent(
+			roomId,
+		)}/`
+		const previewUrl = getDirectPreviewUrl(req, runnerResult.port)
+
+		return res.json({
+			...runnerResult,
+			previewUrl,
+			previewProxyUrl,
+		})
+	} catch (error) {
+		return res.status(400).json({
+			error: `Failed to start project runner: ${(error as Error).message}`,
+		})
+	}
+})
+
+app.post("/api/runner/stop", async (req: Request, res: Response) => {
+	const roomId =
+		typeof req.body?.roomId === "string" ? req.body.roomId.trim() : ""
+	if (!roomId) {
+		return res.status(400).json({ error: "roomId is required." })
+	}
+
+	stopProjectRunnerSession(roomId)
+	return res.json({ stopped: true, roomId })
+})
+
+app.get("/api/runner/status/:roomId", (req: Request, res: Response) => {
+	const roomId = String(req.params.roomId || "").trim()
+	if (!roomId) {
+		return res.status(400).json({ error: "roomId is required." })
+	}
+
+	const status = getProjectRunnerStatus(roomId)
+	if (!status) {
+		return res.json({ roomId, state: "idle" })
+	}
+
+	const previewUrl = `${getServerPublicBaseUrl(req)}/preview/${encodeURIComponent(
+		roomId,
+	)}/`
+	const previewProxyUrl = previewUrl
+
+	return res.json({
+		...status,
+		previewUrl: getDirectPreviewUrl(req, status.port),
+		previewProxyUrl,
+	})
+})
+
+app.get("/api/runner/logs/:roomId", (req: Request, res: Response) => {
+	const roomId = String(req.params.roomId || "").trim()
+	const requestedLimit = Number(req.query.limit || "200")
+	const limit =
+		Number.isFinite(requestedLimit) && requestedLimit > 0
+			? Math.floor(requestedLimit)
+			: 200
+
+	if (!roomId) {
+		return res.status(400).json({ error: "roomId is required." })
+	}
+
+	return res.json({
+		roomId,
+		logs: getProjectRunnerLogs(roomId, limit),
+	})
 })
 
 app.get("/api/oauth/:provider/start", (req: Request, res: Response) => {
@@ -2334,6 +3202,14 @@ app.post("/api/import/external", async (req: Request, res: Response) => {
 	try {
 		const urlValue =
 			typeof req.body?.url === "string" ? req.body.url.trim() : ""
+		const driveAccessToken =
+			typeof req.body?.driveAccessToken === "string"
+				? req.body.driveAccessToken.trim()
+				: ""
+		const githubAccessToken =
+			typeof req.body?.githubAccessToken === "string"
+				? req.body.githubAccessToken.trim()
+				: ""
 
 		if (!urlValue) {
 			return res.status(400).json({ error: "URL is required." })
@@ -2351,9 +3227,12 @@ app.post("/api/import/external", async (req: Request, res: Response) => {
 		}
 
 		const host = parsedUrl.hostname.toLowerCase()
-		let provider: "github" | "gdrive"
+		let provider: ExternalImportProvider
 		let downloadUrl = urlValue
 		let fileNameFallback = ""
+		let driveFileId = ""
+		let driveResourceKey = ""
+		let driveLinkKind: DriveLinkKind = "unknown"
 
 		if (host === "github.com" || host === "raw.githubusercontent.com") {
 			provider = "github"
@@ -2365,29 +3244,120 @@ app.post("/api/import/external", async (req: Request, res: Response) => {
 			}
 			downloadUrl = githubRawUrl
 			fileNameFallback = getFileNameFromPath(new URL(githubRawUrl).pathname)
-		} else if (host.endsWith("drive.google.com") || host === "docs.google.com") {
+		} else if (
+			host.endsWith("drive.google.com") ||
+			host === "docs.google.com" ||
+			host === "drive.usercontent.google.com"
+		) {
 			provider = "gdrive"
-			const driveFileId = extractDriveFileId(urlValue)
-			if (!driveFileId) {
+			const driveLinkInfo = extractDriveLinkInfo(parsedUrl, urlValue)
+			if (!driveLinkInfo) {
 				return res.status(400).json({
 					error: "Unable to read Google Drive file ID from URL.",
 				})
 			}
-			downloadUrl = `https://drive.google.com/uc?export=download&id=${driveFileId}`
-			fileNameFallback = `drive-file-${driveFileId}`
+			driveFileId = driveLinkInfo.fileId
+			driveResourceKey = driveLinkInfo.resourceKey
+			driveLinkKind = driveLinkInfo.kind
+			downloadUrl = buildDriveDownloadUrl(driveLinkInfo)
+			fileNameFallback = getDriveFileNameFallback(driveFileId, driveLinkKind)
 		} else {
-			return res.status(400).json({
-				error: "Only GitHub and Google Drive URLs are supported.",
-			})
+			const wrappedUrl = tryGetDirectAssetUrlFromPageUrl(urlValue)
+			if (wrappedUrl) {
+				try {
+					const wrappedParsedUrl = new URL(wrappedUrl)
+					const wrappedHost = wrappedParsedUrl.hostname.toLowerCase()
+
+					if (
+						wrappedHost === "github.com" ||
+						wrappedHost === "raw.githubusercontent.com"
+					) {
+						const githubRawUrl = getGithubRawUrl(wrappedParsedUrl)
+						if (githubRawUrl) {
+							provider = "github"
+							downloadUrl = githubRawUrl
+							fileNameFallback = getFileNameFromPath(new URL(githubRawUrl).pathname)
+						} else {
+							provider = "direct"
+							downloadUrl = wrappedUrl
+							fileNameFallback = getFileNameFromPath(wrappedParsedUrl.pathname)
+						}
+					} else if (
+						wrappedHost.endsWith("drive.google.com") ||
+						wrappedHost === "docs.google.com" ||
+						wrappedHost === "drive.usercontent.google.com"
+					) {
+						const driveLinkInfo = extractDriveLinkInfo(wrappedParsedUrl, wrappedUrl)
+						if (driveLinkInfo) {
+							provider = "gdrive"
+							driveFileId = driveLinkInfo.fileId
+							driveResourceKey = driveLinkInfo.resourceKey
+							driveLinkKind = driveLinkInfo.kind
+							downloadUrl = buildDriveDownloadUrl(driveLinkInfo)
+							fileNameFallback = getDriveFileNameFallback(driveFileId, driveLinkKind)
+						} else {
+							provider = "direct"
+							downloadUrl = wrappedUrl
+							fileNameFallback = getFileNameFromPath(wrappedParsedUrl.pathname)
+						}
+					} else {
+						provider = "direct"
+						downloadUrl = wrappedUrl
+						fileNameFallback = getFileNameFromPath(wrappedParsedUrl.pathname)
+					}
+				} catch {
+					provider = "direct"
+					fileNameFallback = getFileNameFromPath(parsedUrl.pathname)
+				}
+			} else {
+				provider = "direct"
+				fileNameFallback = getFileNameFromPath(parsedUrl.pathname)
+			}
 		}
 
-		const requestHeaders: Record<string, string> = {}
-		const githubToken = (process.env.GITHUB_TOKEN || "").trim()
+		if (provider === "gdrive" && driveFileId && driveAccessToken) {
+			const driveApiDownload = await tryDownloadDriveFileWithAccessToken({
+				fileId: driveFileId,
+				accessToken: driveAccessToken,
+			})
+			if (driveApiDownload) {
+				const { buffer, mimeType, fileName } = driveApiDownload
+				if (buffer.length > maxExternalImportSizeBytes) {
+					return res.status(413).json({
+						error: `File is too large. Maximum allowed size is ${maxExternalImportSizeMb}MB.`,
+					})
+				}
+
+				const resolvedFileName = sanitizeImportedFileName(
+					fileName || fileNameFallback || `imported-file-${Date.now()}`,
+				)
+				const isLikelyText = isLikelyTextFile(mimeType, buffer)
+				return res.json({
+					provider,
+					fileName: resolvedFileName,
+					mimeType,
+					size: buffer.length,
+					isLikelyText,
+					textContent: isLikelyText ? buffer.toString("utf8") : "",
+					base64Content: isLikelyText ? null : buffer.toString("base64"),
+				})
+			}
+		}
+
+		const requestHeaders: Record<string, string> = {
+			"User-Agent": "CodeCoalitionExternalImporter/1.0",
+			Accept: "*/*",
+		}
+		const githubToken =
+			githubAccessToken || (process.env.GITHUB_TOKEN || "").trim()
 		if (provider === "github" && githubToken) {
 			requestHeaders.Authorization = `Bearer ${githubToken}`
 		}
+		if (provider === "gdrive" && driveAccessToken) {
+			requestHeaders.Authorization = `Bearer ${driveAccessToken}`
+		}
 
-		const downloadResponse = await fetch(downloadUrl, {
+		let downloadResponse = await fetch(downloadUrl, {
 			method: "GET",
 			headers: requestHeaders,
 			redirect: "follow",
@@ -2399,11 +3369,155 @@ app.post("/api/import/external", async (req: Request, res: Response) => {
 			})
 		}
 
-		const arrayBuffer = await downloadResponse.arrayBuffer()
-		const buffer = Buffer.from(arrayBuffer)
+		let buffer = Buffer.from(await downloadResponse.arrayBuffer())
+		if (provider === "gdrive" && driveFileId && driveLinkKind === "file") {
+			const initialMimeType =
+				(downloadResponse.headers.get("content-type") || "application/octet-stream")
+					.split(";")[0]
+					.trim()
+					.toLowerCase()
+			if (initialMimeType === "text/html") {
+				const htmlBody = buffer.toString("utf8")
+				const followUpCandidates: string[] = []
+				const followUpFromHtml = extractGoogleDriveFollowUpUrl({
+					html: htmlBody,
+					baseUrl: downloadResponse.url || downloadUrl,
+					fileId: driveFileId,
+					resourceKey: driveResourceKey,
+				})
+				if (followUpFromHtml) {
+					followUpCandidates.push(followUpFromHtml)
+				}
+
+				const confirmToken = extractGoogleDriveConfirmToken(htmlBody)
+				if (confirmToken) {
+					followUpCandidates.push(
+						`https://drive.google.com/uc?export=download&confirm=${encodeURIComponent(
+							confirmToken,
+						)}&id=${encodeURIComponent(driveFileId)}${
+							driveResourceKey
+								? `&resourcekey=${encodeURIComponent(driveResourceKey)}`
+								: ""
+						}`,
+					)
+				}
+
+				const seenCandidateUrls = new Set<string>()
+				for (const candidateUrlRaw of followUpCandidates) {
+					const candidateUrl = candidateUrlRaw.trim()
+					if (!candidateUrl || seenCandidateUrls.has(candidateUrl)) {
+						continue
+					}
+					seenCandidateUrls.add(candidateUrl)
+
+					const candidateResponse = await fetch(candidateUrl, {
+						method: "GET",
+						headers: requestHeaders,
+						redirect: "follow",
+					})
+					if (!candidateResponse.ok) {
+						continue
+					}
+
+					const candidateBuffer = Buffer.from(await candidateResponse.arrayBuffer())
+					if (candidateBuffer.length === 0) {
+						continue
+					}
+
+					downloadResponse = candidateResponse
+					buffer = candidateBuffer
+					const candidateMimeType =
+						(candidateResponse.headers.get("content-type") || "application/octet-stream")
+							.split(";")[0]
+							.trim()
+							.toLowerCase()
+					if (candidateMimeType !== "text/html") {
+						break
+					}
+				}
+			}
+		}
+
+		if (provider === "gdrive" && driveFileId) {
+			const currentUrl = downloadResponse.url || downloadUrl
+			const triedUrls = new Set<string>([downloadUrl, currentUrl])
+			const fallbackUrls = buildDriveAnonymousFallbackUrls({
+				fileId: driveFileId,
+				resourceKey: driveResourceKey,
+			})
+
+			for (const fallbackUrl of fallbackUrls) {
+				const trimmedFallbackUrl = fallbackUrl.trim()
+				if (!trimmedFallbackUrl || triedUrls.has(trimmedFallbackUrl)) {
+					continue
+				}
+				triedUrls.add(trimmedFallbackUrl)
+
+				const fallbackResponse = await fetch(trimmedFallbackUrl, {
+					method: "GET",
+					headers: requestHeaders,
+					redirect: "follow",
+				})
+				if (!fallbackResponse.ok) {
+					continue
+				}
+
+				const fallbackBuffer = Buffer.from(await fallbackResponse.arrayBuffer())
+				if (fallbackBuffer.length === 0) {
+					continue
+				}
+
+				downloadResponse = fallbackResponse
+				buffer = fallbackBuffer
+				break
+			}
+		}
 
 		if (buffer.length === 0) {
 			return res.status(400).json({ error: "Downloaded file is empty." })
+		}
+
+		const contentTypeHeader =
+			downloadResponse.headers.get("content-type") || "application/octet-stream"
+		let mimeType = contentTypeHeader.split(";")[0].trim() || "application/octet-stream"
+		let finalDownloadUrl = downloadResponse.url || downloadUrl
+
+		const fileNameFromHeader = parseFileNameFromContentDisposition(
+			downloadResponse.headers.get("content-disposition"),
+		)
+		let fileNameCandidate =
+			fileNameFromHeader || fileNameFallback || `imported-file-${Date.now()}`
+
+		// Some providers return a "view page" URL where the direct file URL is present
+		// in query params (for example imgurl/mediaurl). Try that first.
+		if (mimeType.toLowerCase() === "text/html") {
+			const directAssetUrl = tryGetDirectAssetUrlFromPageUrl(finalDownloadUrl)
+			if (directAssetUrl) {
+				const assetResponse = await fetch(directAssetUrl, {
+					method: "GET",
+					headers: requestHeaders,
+					redirect: "follow",
+				})
+				if (assetResponse.ok) {
+					const assetBuffer = Buffer.from(await assetResponse.arrayBuffer())
+					const assetMimeType =
+						(assetResponse.headers.get("content-type") || "application/octet-stream")
+							.split(";")[0]
+							.trim() || "application/octet-stream"
+					if (assetBuffer.length > 0 && assetMimeType.toLowerCase() !== "text/html") {
+						downloadResponse = assetResponse
+						buffer = assetBuffer
+						mimeType = assetMimeType
+						finalDownloadUrl = assetResponse.url || directAssetUrl
+						const assetFileName = getFileNameFromPath(
+							new URL(finalDownloadUrl).pathname,
+						)
+						if (assetFileName) {
+							fileNameCandidate = assetFileName
+						}
+					}
+				}
+			}
 		}
 
 		if (buffer.length > maxExternalImportSizeBytes) {
@@ -2412,15 +3526,25 @@ app.post("/api/import/external", async (req: Request, res: Response) => {
 			})
 		}
 
-		const contentTypeHeader =
-			downloadResponse.headers.get("content-type") || "application/octet-stream"
-		const mimeType = contentTypeHeader.split(";")[0].trim() || "application/octet-stream"
-		const fileNameFromHeader = parseFileNameFromContentDisposition(
-			downloadResponse.headers.get("content-disposition"),
-		)
-		const resolvedFileName = sanitizeImportedFileName(
-			fileNameFromHeader || fileNameFallback || `imported-file-${Date.now()}`,
-		)
+		const authPageDetected = isHtmlAuthPageResponse({
+			provider,
+			mimeType,
+			buffer,
+			finalUrl: finalDownloadUrl,
+		})
+		if (mimeType.toLowerCase() === "text/html") {
+			const htmlSnapshot = buildHtmlSnapshotText({
+				html: buffer.toString("utf8"),
+				sourceUrl: finalDownloadUrl,
+				fileNameHint: fileNameCandidate,
+				authPageDetected,
+			})
+			buffer = htmlSnapshot.buffer
+			mimeType = htmlSnapshot.mimeType
+			fileNameCandidate = htmlSnapshot.fileName
+		}
+
+		const resolvedFileName = sanitizeImportedFileName(fileNameCandidate)
 		const isLikelyText = isLikelyTextFile(mimeType, buffer)
 
 		return res.json({
@@ -2440,9 +3564,32 @@ app.post("/api/import/external", async (req: Request, res: Response) => {
 	}
 })
 
+app.use("/preview/:roomId", (req: Request, res: Response) => {
+	const roomId = String(req.params.roomId || "").trim()
+	if (!roomId) {
+		return res.status(400).json({ error: "roomId is required." })
+	}
+
+	const target = resolvePreviewTarget(roomId)
+	if (!target) {
+		return res.status(404).json({
+			error: "No running app found for this room. Press Run first.",
+		})
+	}
+
+	proxyPreviewRequest(req, res, roomId, target.port)
+})
+
 app.get("/", (req: Request, res: Response) => {
 	// Send the index.html file
 	res.sendFile(path.join(__dirname, "..", "public", "index.html"))
+})
+
+server.on("upgrade", (req, socket, head) => {
+	const handled = proxyPreviewUpgrade(req, socket, head)
+	if (handled) {
+		return
+	}
 })
 
 server.listen(PORT, () => {

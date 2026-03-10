@@ -1,4 +1,5 @@
 import { DrawingData } from "@/types/app"
+import { BACKEND_URL } from "@/config/backend"
 import {
     SocketContext as SocketContextType,
     SocketEvent,
@@ -26,8 +27,6 @@ export const useSocket = (): SocketContextType => {
     }
     return context
 }
-
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:3000"
 
 const upsertUser = (users: RemoteUser[], user: RemoteUser): RemoteUser[] => {
     const existingIndex = users.findIndex((u) => u.socketId === user.socketId)

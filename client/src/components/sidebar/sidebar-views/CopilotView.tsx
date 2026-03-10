@@ -251,6 +251,15 @@ function CopilotView() {
         applyCopilotCodeToFile("replace")
     }
 
+    const handlePromptKeyDown = (
+        event: React.KeyboardEvent<HTMLTextAreaElement>,
+    ) => {
+        if (event.key !== "Enter" || event.shiftKey) return
+        event.preventDefault()
+        if (isRunning) return
+        generateCode()
+    }
+
     return (
         <div
             className="sidebar-modern-view flex max-h-full min-h-[400px] w-full flex-col gap-3 p-4"
@@ -263,6 +272,7 @@ function CopilotView() {
                 className="sidebar-modern-control min-h-[120px] p-2 text-sm"
                 placeholder="Ask anything: code, errors, concepts, or project questions..."
                 onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handlePromptKeyDown}
             />
             <button
                 className="sidebar-modern-btn sidebar-modern-btn--primary mt-1 flex w-full justify-center"

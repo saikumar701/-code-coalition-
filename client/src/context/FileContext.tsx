@@ -31,6 +31,58 @@ import { useSocket } from "./SocketContext"
 
 const FileContext = createContext<FileContextType | null>(null)
 
+const textMimeByExtension: Record<string, string> = {
+    c: "text/x-csrc",
+    cpp: "text/x-c++src",
+    css: "text/css",
+    go: "text/x-go",
+    h: "text/x-csrc",
+    hpp: "text/x-c++src",
+    html: "text/html",
+    java: "text/x-java-source",
+    js: "text/javascript",
+    json: "application/json",
+    jsx: "text/javascript",
+    md: "text/markdown",
+    py: "text/x-python",
+    rs: "text/x-rust",
+    sh: "text/x-shellscript",
+    sql: "text/x-sql",
+    ts: "text/typescript",
+    tsx: "text/typescript",
+    txt: "text/plain",
+    xml: "application/xml",
+    yaml: "text/yaml",
+    yml: "text/yaml",
+}
+
+function getFileExtension(fileName: string): string {
+    const parts = fileName.toLowerCase().split(".")
+    return parts.length > 1 ? parts.pop() || "" : ""
+}
+
+function resolveImportedMimeType(
+    fileName: string,
+    mimeType: string | undefined,
+    contentEncoding: "utf8" | "base64" | undefined,
+): string {
+    const normalizedMimeType = (mimeType || "").split(";")[0].trim().toLowerCase()
+    if (normalizedMimeType && normalizedMimeType !== "application/octet-stream") {
+        return normalizedMimeType
+    }
+
+    const extension = getFileExtension(fileName)
+    if (extension && textMimeByExtension[extension]) {
+        return textMimeByExtension[extension]
+    }
+
+    if (contentEncoding === "utf8") {
+        return "text/plain"
+    }
+
+    return normalizedMimeType || "application/octet-stream"
+}
+
 const getInitialFileState = () => {
     const fileStructure = createInitialFileStructure()
     const openFiles = fileStructure.children ? [...fileStructure.children] : []
@@ -372,13 +424,20 @@ function FileContextProvider({ children }: { children: ReactNode }) {
             sendToSocket = false,
             options?: ImportFileOptions,
         ): Id | null => {
+            const contentEncoding = options?.contentEncoding || "utf8"
+            const shouldOpenInEditor = Boolean(options?.openInEditor)
+            const mimeType = resolveImportedMimeType(
+                fileName,
+                options?.mimeType,
+                contentEncoding,
+            )
             const newFile: FileSystemItem = {
                 id: uuidv4(),
                 name: fileName,
                 type: "file",
                 content: fileContent,
-                contentEncoding: options?.contentEncoding || "utf8",
-                mimeType: options?.mimeType || "text/plain",
+                contentEncoding,
+                mimeType,
             }
 
             setFileStructure(prev =>
@@ -388,6 +447,14 @@ function FileContextProvider({ children }: { children: ReactNode }) {
                         : item
                 ) as FileSystemItem
             )
+
+            if (shouldOpenInEditor) {
+                setOpenFiles((prevOpenFiles) => {
+                    const exists = prevOpenFiles.some((file) => file.id === newFile.id)
+                    return exists ? prevOpenFiles : [...prevOpenFiles, newFile]
+                })
+                setActiveFile(newFile)
+            }
 
             if (sendToSocket) {
                 socket.emit(SocketEvent.FILE_CREATED, { parentDirId, newFile })
@@ -625,14 +692,17 @@ function FileContextProvider({ children }: { children: ReactNode }) {
     ])
 
     // Keep the server workspace synchronized with the current file tree.
+    // Even when auto-save is OFF, sync with a slower debounce so project state
+    // still persists for run/rejoin flows.
     useEffect(() => {
-        if (status !== USER_STATUS.JOINED || !currentUser.roomId || !autoSaveEnabled) return
+        if (status !== USER_STATUS.JOINED || !currentUser.roomId) return
 
+        const debounceMs = autoSaveEnabled ? 200 : 2000
         const timeout = setTimeout(() => {
             socket.emit(SocketEvent.WORKSPACE_SYNC, {
                 fileStructure: mergeActiveFileIntoStructure(fileStructure, activeFile),
             })
-        }, 200)
+        }, debounceMs)
 
         return () => clearTimeout(timeout)
     }, [
@@ -640,6 +710,31 @@ function FileContextProvider({ children }: { children: ReactNode }) {
         currentUser.roomId,
         fileStructure,
         autoSaveEnabled,
+        mergeActiveFileIntoStructure,
+        socket,
+        status,
+    ])
+
+    // Flush latest workspace when the tab is being closed/refreshed.
+    useEffect(() => {
+        if (status !== USER_STATUS.JOINED || !currentUser.roomId) return
+
+        const flushWorkspace = () => {
+            socket.emit(SocketEvent.WORKSPACE_SYNC, {
+                fileStructure: mergeActiveFileIntoStructure(fileStructure, activeFile),
+            })
+        }
+
+        window.addEventListener("pagehide", flushWorkspace)
+        window.addEventListener("beforeunload", flushWorkspace)
+        return () => {
+            window.removeEventListener("pagehide", flushWorkspace)
+            window.removeEventListener("beforeunload", flushWorkspace)
+        }
+    }, [
+        activeFile,
+        currentUser.roomId,
+        fileStructure,
         mergeActiveFileIntoStructure,
         socket,
         status,

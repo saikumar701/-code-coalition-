@@ -1,15 +1,20 @@
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:3000"
+import { BACKEND_URL } from "@/config/backend"
 
 type OAuthProvider = "github" | "gdrive"
 
 interface ExternalImportResult {
-    provider: "github" | "gdrive"
+    provider: "github" | "gdrive" | "direct"
     fileName: string
     mimeType: string
     size: number
     isLikelyText: boolean
     textContent: string
     base64Content: string | null
+}
+
+interface ExternalImportOptions {
+    driveAccessToken?: string
+    githubAccessToken?: string
 }
 
 interface OAuthStartResponse {
@@ -46,6 +51,11 @@ interface AccountImportPayload {
     size: number
 }
 
+interface GithubFolderImportEntry {
+    relativePath: string
+    payload: AccountImportPayload
+}
+
 interface GoogleDriveEntry {
     id: string
     name: string
@@ -67,6 +77,13 @@ const toBase64 = (bytes: Uint8Array): string => {
     return btoa(binary)
 }
 
+const normalizeGithubPath = (value: string): string =>
+    value
+        .split("/")
+        .map((segment) => segment.trim())
+        .filter(Boolean)
+        .join("/")
+
 const ensureResponseOk = async (
     response: Response,
     fallbackMessage: string,
@@ -80,16 +97,23 @@ const ensureResponseOk = async (
             : typeof payload?.message === "string"
                 ? payload.message
                 : fallbackMessage
-    throw new Error(message)
+    throw new Error(`${message} (status ${response.status})`)
 }
 
-const importExternalFile = async (url: string): Promise<ExternalImportResult> => {
+const importExternalFile = async (
+    url: string,
+    options?: ExternalImportOptions,
+): Promise<ExternalImportResult> => {
     const response = await fetch(`${BACKEND_URL}/api/import/external`, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
         },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({
+            url,
+            driveAccessToken: options?.driveAccessToken || "",
+            githubAccessToken: options?.githubAccessToken || "",
+        }),
     })
 
     const payload = await response.json().catch(() => null)
@@ -328,9 +352,81 @@ const fetchDriveFileContent = async ({
     }
 }
 
+const fetchGithubFolderFiles = async ({
+    accessToken,
+    owner,
+    repo,
+    path = "",
+    branch,
+    maxFiles = 400,
+}: {
+    accessToken: string
+    owner: string
+    repo: string
+    path?: string
+    branch: string
+    maxFiles?: number
+}): Promise<GithubFolderImportEntry[]> => {
+    const basePath = normalizeGithubPath(path)
+    const pendingDirectories: string[] = [basePath]
+    const importedFiles: GithubFolderImportEntry[] = []
+
+    while (pendingDirectories.length > 0) {
+        const currentPath = pendingDirectories.shift() || ""
+        const entries = await fetchGithubDirectoryEntries({
+            accessToken,
+            owner,
+            repo,
+            path: currentPath,
+            branch,
+        })
+
+        for (const entry of entries) {
+            if (entry.type === "dir") {
+                pendingDirectories.push(normalizeGithubPath(entry.path))
+                continue
+            }
+
+            if (entry.type !== "file") {
+                continue
+            }
+
+            if (importedFiles.length >= maxFiles) {
+                throw new Error(
+                    `This import has more than ${maxFiles} files. Import a smaller folder.`,
+                )
+            }
+
+            const payload = await fetchGithubFileContent({
+                accessToken,
+                owner,
+                repo,
+                path: entry.path,
+                branch,
+            })
+
+            const normalizedEntryPath = normalizeGithubPath(entry.path)
+            const relativePath = basePath
+                ? normalizedEntryPath.startsWith(`${basePath}/`)
+                    ? normalizedEntryPath.slice(basePath.length + 1)
+                    : payload.fileName
+                : normalizedEntryPath
+
+            importedFiles.push({
+                relativePath: normalizeGithubPath(relativePath) || payload.fileName,
+                payload,
+            })
+        }
+    }
+
+    return importedFiles
+}
+
 export type {
+    ExternalImportOptions,
     AccountImportPayload,
     ExternalImportResult,
+    GithubFolderImportEntry,
     GithubEntry,
     GithubRepo,
     GoogleDriveEntry,
@@ -341,6 +437,7 @@ export {
     fetchDriveFiles,
     fetchGithubDirectoryEntries,
     fetchGithubFileContent,
+    fetchGithubFolderFiles,
     fetchGithubRepos,
     getOAuthAuthorizeUrl,
     importExternalFile,

@@ -1,6 +1,5 @@
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable"
 import EditorComponent from "../components/editor/EditorComponent"
-import DrawingEditor from "../components/drawing/DrawingEditor"
 import LeftSidebar from "../components/LeftSidebar"
 import FileStructureView from "../components/files/FileStructureView"
 import ChatsView from "../components/sidebar/sidebar-views/ChatsView"
@@ -12,7 +11,6 @@ import SettingsView from "../components/sidebar/sidebar-views/SettingsView"
 import UsersView from "../components/sidebar/sidebar-views/UsersView"
 import TerminalView from "../components/terminal-view"
 import TopToolbar from "../components/TopToolbar"
-import { useState, useEffect, useRef } from "react"
 import { Code2, Pencil } from "lucide-react"
 import { useAppContext } from "@/context/AppContext"
 import { useSocket } from "@/context/SocketContext"
@@ -23,6 +21,9 @@ import angryCatGif from "@/assets/u_mey4kjj5ww-angry-2498_512.gif"
 import peekingCatGif from "@/assets/misskalem-cat-17977_512.gif"
 import { useRunCode } from "@/context/RunCodeContext"
 import { getClientSessionId } from "@/utils/session"
+import { lazy, Suspense, useState, useEffect, useRef } from "react"
+
+const DrawingEditor = lazy(() => import("../components/drawing/DrawingEditor"))
 
 type TerminalOutputPayload = {
     data?: string
@@ -287,7 +288,15 @@ const EditorPage = () => {
                                         )}
                                         {activeEditorTab === "draw" && (
                                             <div key={`draw-${editorKey}`} className="absolute inset-0">
-                                                <DrawingEditor />
+                                                <Suspense
+                                                    fallback={
+                                                        <div className="flex h-full items-center justify-center text-sm text-slate-300">
+                                                            Loading drawing board...
+                                                        </div>
+                                                    }
+                                                >
+                                                    <DrawingEditor />
+                                                </Suspense>
                                             </div>
                                         )}
                                     </div>

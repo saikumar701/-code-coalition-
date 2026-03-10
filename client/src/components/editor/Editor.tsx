@@ -99,10 +99,6 @@ function Editor() {
             const selectionStart = selection.from
             const selectionEnd = selection.to
 
-            console.log('⌨️ TYPING_START emitted:', {
-                fileId: activeFile.id,
-                cursorPosition,
-            })
             // Emit cursor and selection data
             socket.emit(SocketEvent.TYPING_START, {
                 fileId: activeFile.id,
@@ -124,7 +120,6 @@ function Editor() {
         }
 
         typingTimeoutRef.current = setTimeout(() => {
-            console.log('⏸️ TYPING_PAUSE emitted')
             socket.emit(SocketEvent.TYPING_PAUSE, {
                 fileId: activeFile.id,
             })
@@ -171,11 +166,6 @@ function Editor() {
         cursorMoveTimeoutRef.current = setTimeout(() => {
             if (!activeFile) return
             
-            console.log('➡️ CURSOR_MOVE emitted:', {
-                fileId: activeFile.id,
-                cursorPosition,
-            })
-            
             socket.emit(SocketEvent.CURSOR_MOVE, {
                 fileId: activeFile.id,
                 cursorPosition,
@@ -191,7 +181,6 @@ function Editor() {
     // Emit FILE_OPENED when user switches files
     useEffect(() => {
         if (activeFile && socket) {
-            console.log('📂 FILE_OPENED emitted:', activeFile.id)
             socket.emit(SocketEvent.FILE_OPENED, {
                 fileId: activeFile.id,
             })
@@ -246,7 +235,6 @@ function Editor() {
     useEffect(() => {
         const view = editorRef.current?.view
         if (view) {
-            console.log('🔄 Updating remote users:', filteredUsers.length)
             view.dispatch({
                 effects: updateRemoteUsers.of(filteredUsers)
             })

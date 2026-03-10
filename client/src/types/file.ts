@@ -17,6 +17,7 @@ interface FileSystemItem {
 interface ImportFileOptions {
     contentEncoding?: FileContentEncoding
     mimeType?: string
+    openInEditor?: boolean
 }
 
 interface FileContext {

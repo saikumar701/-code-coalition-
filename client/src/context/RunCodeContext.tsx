@@ -1,4 +1,8 @@
 import axiosInstance from "@/api/pistonApi"
+import axios from "axios"
+import { BACKEND_URL } from "@/config/backend"
+import { FileSystemItem } from "@/types/file"
+import { SocketEvent } from "@/types/socket"
 import {
     Language,
     RunContext as RunContextType,
@@ -14,6 +18,8 @@ import {
 } from "react"
 import toast from "react-hot-toast"
 import { useFileSystem } from "./FileContext"
+import { useAppContext } from "./AppContext"
+import { useSocket } from "./SocketContext"
 
 const RunCodeContext = createContext<RunContextType | null>(null)
 const EMPTY_LANGUAGE: Language = { language: "", version: "", aliases: [] }
@@ -301,6 +307,110 @@ function isHtmlPreviewFile(file: RunnableFile): boolean {
     return contentCandidates.includes("html")
 }
 
+const projectManifestNames = new Set([
+    "package.json",
+    "requirements.txt",
+    "pyproject.toml",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "gradlew",
+    "gradlew.bat",
+    "manage.py",
+])
+
+function collectFileNames(root: FileSystemItem | null): Set<string> {
+    const names = new Set<string>()
+    if (!root) return names
+    const stack: FileSystemItem[] = [root]
+
+    while (stack.length > 0) {
+        const current = stack.pop()
+        if (!current) continue
+        names.add(current.name.trim().toLowerCase())
+        if (current.type === "directory" && Array.isArray(current.children)) {
+            stack.push(...current.children)
+        }
+    }
+
+    return names
+}
+
+function hasRunnableProjectManifest(root: FileSystemItem | null): boolean {
+    const fileNames = collectFileNames(root)
+    return [...projectManifestNames].some((fileName) => fileNames.has(fileName))
+}
+
+function mergeActiveFileIntoStructure(
+    structure: FileSystemItem,
+    currentActiveFile: FileSystemItem | null,
+): FileSystemItem {
+    if (!currentActiveFile || currentActiveFile.type !== "file") {
+        return structure
+    }
+
+    const updateNode = (node: FileSystemItem): FileSystemItem => {
+        if (node.type === "file" && node.id === currentActiveFile.id) {
+            return {
+                ...node,
+                content: currentActiveFile.content || "",
+                contentEncoding: currentActiveFile.contentEncoding || "utf8",
+                mimeType: currentActiveFile.mimeType || node.mimeType,
+            }
+        }
+
+        if (node.type === "directory" && Array.isArray(node.children)) {
+            return {
+                ...node,
+                children: node.children.map(updateNode),
+            }
+        }
+
+        return node
+    }
+
+    return updateNode(structure)
+}
+
+function findItemPathById(
+    root: FileSystemItem | null,
+    targetId: string,
+    parentPath = "",
+): string | null {
+    if (!root || !targetId) return null
+
+    const currentPath = parentPath ? `${parentPath}/${root.name}` : root.name
+    if (root.id === targetId) {
+        return currentPath
+    }
+
+    if (root.type !== "directory" || !Array.isArray(root.children)) {
+        return null
+    }
+
+    for (const child of root.children) {
+        const childPath = findItemPathById(child, targetId, currentPath)
+        if (childPath) return childPath
+    }
+
+    return null
+}
+
+interface RunnerStartResponse {
+    previewUrl?: string
+    previewProxyUrl?: string
+    stack?: string
+    cwd?: string
+    command?: string
+    installLogs?: string
+    startupLogs?: string
+}
+
+interface RunnerStatusResponse {
+    previewUrl?: string
+    previewProxyUrl?: string
+}
+
 export const useRunCode = () => {
     const context = useContext(RunCodeContext)
     if (context === null) {
@@ -312,16 +422,20 @@ export const useRunCode = () => {
 }
 
 const RunCodeContextProvider = ({ children }: { children: ReactNode }) => {
-    const { activeFile } = useFileSystem()
+    const { activeFile, fileStructure } = useFileSystem()
+    const { currentUser } = useAppContext()
+    const { socket } = useSocket()
     const [input, setInput] = useState<string>("")
     const [output, setOutput] = useState<string>("")
     const [outputMode, setOutputMode] = useState<"text" | "html">("text")
+    const [previewUrl, setPreviewUrl] = useState<string>("")
     const [isRunning, setIsRunning] = useState<boolean>(false)
     const [hasRunError, setHasRunError] = useState<boolean>(false)
     const [diagnostics, setDiagnostics] = useState<RunDiagnostic[]>([])
     const [diagnosticFileId, setDiagnosticFileId] = useState<string | null>(null)
     const [supportedLanguages, setSupportedLanguages] = useState<Language[]>([])
     const [selectedLanguage, setSelectedLanguage] = useState<Language>(EMPTY_LANGUAGE)
+    const [isStoppingRunner, setIsStoppingRunner] = useState<boolean>(false)
 
     useEffect(() => {
         const fetchSupportedLanguages = async () => {
@@ -336,6 +450,39 @@ const RunCodeContextProvider = ({ children }: { children: ReactNode }) => {
 
         fetchSupportedLanguages()
     }, [])
+
+    useEffect(() => {
+        const roomId = currentUser.roomId.trim()
+        if (!roomId) {
+            setPreviewUrl("")
+            return
+        }
+
+        let cancelled = false
+        const fetchRunnerStatus = async () => {
+            try {
+                const response = await axios.get(
+                    `${BACKEND_URL}/api/runner/status/${encodeURIComponent(roomId)}`,
+                )
+                if (cancelled) return
+                const statusData = response.data as RunnerStatusResponse
+                const urlFromServer =
+                    (typeof statusData?.previewUrl === "string" && statusData.previewUrl) ||
+                    (typeof statusData?.previewProxyUrl === "string"
+                        ? statusData.previewProxyUrl
+                        : "") ||
+                    ""
+                setPreviewUrl(urlFromServer)
+            } catch {
+                if (!cancelled) setPreviewUrl("")
+            }
+        }
+
+        fetchRunnerStatus()
+        return () => {
+            cancelled = true
+        }
+    }, [currentUser.roomId])
 
     // Infer selected language from extension, MIME type, and content.
     useEffect(() => {
@@ -361,7 +508,171 @@ const RunCodeContextProvider = ({ children }: { children: ReactNode }) => {
         setSelectedLanguage(EMPTY_LANGUAGE)
     }, [activeFile?.content, activeFile?.mimeType, activeFile?.name, supportedLanguages])
 
+    const openPreviewInNewTab = () => {
+        if (!previewUrl) {
+            toast.error("Run a project first to open preview")
+            return
+        }
+        window.open(previewUrl, "_blank", "noopener,noreferrer")
+    }
+
+    const stopProjectRunner = async () => {
+        const roomId = currentUser.roomId.trim()
+        if (!roomId) {
+            toast.error("Join a room before stopping project preview")
+            return
+        }
+
+        setIsStoppingRunner(true)
+        toast.loading("Stopping project...", { id: "project-stop" })
+        try {
+            await axios.post(`${BACKEND_URL}/api/runner/stop`, { roomId })
+            setPreviewUrl("")
+            setOutput("Project runner stopped.")
+            setOutputMode("text")
+            setHasRunError(false)
+            toast.dismiss("project-stop")
+            toast.success("Project stopped")
+        } catch (error: any) {
+            const errorMessage =
+                axios.isAxiosError(error) && !error.response
+                    ? `Cannot reach backend at ${BACKEND_URL}.`
+                    : error?.response?.data?.error ||
+                      error?.message ||
+                      "Failed to stop project runner"
+            toast.dismiss("project-stop")
+            toast.error(errorMessage)
+        } finally {
+            setIsStoppingRunner(false)
+        }
+    }
+
+    const runProjectApp = async (): Promise<boolean> => {
+        if (!hasRunnableProjectManifest(fileStructure)) return false
+
+        const roomId = currentUser.roomId.trim()
+        if (!roomId) {
+            toast.error("Join a room before running project preview")
+            return true
+        }
+
+        setIsRunning(true)
+        setHasRunError(false)
+        setDiagnostics([])
+        setDiagnosticFileId(activeFile?.id || null)
+        setOutputMode("text")
+        setPreviewUrl("")
+        toast.loading("Starting project...", { id: "project-runner" })
+
+        try {
+            const runFileStructure = mergeActiveFileIntoStructure(
+                fileStructure,
+                activeFile,
+            )
+            const activeFilePath = activeFile?.id
+                ? Array.isArray(runFileStructure.children)
+                    ? runFileStructure.children
+                          .map((child) => findItemPathById(child, activeFile.id, ""))
+                          .find((candidatePath): candidatePath is string => Boolean(candidatePath)) ||
+                      null
+                    : findItemPathById(runFileStructure, activeFile.id, "")
+                : null
+            socket.emit(SocketEvent.WORKSPACE_SYNC, {
+                fileStructure: runFileStructure,
+            })
+            await new Promise((resolve) => setTimeout(resolve, 250))
+
+            const response = await axios.post<RunnerStartResponse>(
+                `${BACKEND_URL}/api/runner/start`,
+                {
+                    roomId,
+                    fileStructure: runFileStructure,
+                    preferredProjectPath: activeFilePath || "",
+                },
+            )
+
+            const nextPreviewUrl =
+                (typeof response.data?.previewUrl === "string" && response.data.previewUrl) ||
+                (typeof response.data?.previewProxyUrl === "string"
+                    ? response.data.previewProxyUrl
+                    : "") ||
+                ""
+            const installLogs =
+                typeof response.data?.installLogs === "string"
+                    ? response.data.installLogs.trim()
+                    : ""
+            const startupLogs =
+                typeof response.data?.startupLogs === "string"
+                    ? response.data.startupLogs.trim()
+                    : ""
+            const command =
+                typeof response.data?.command === "string"
+                    ? response.data.command
+                    : ""
+            const cwd =
+                typeof response.data?.cwd === "string"
+                    ? response.data.cwd
+                    : ""
+            const stack =
+                typeof response.data?.stack === "string" ? response.data.stack : "project"
+
+            setPreviewUrl(nextPreviewUrl)
+            setOutput(
+                [
+                    `Project runner started (${stack}).`,
+                    cwd ? `Working directory: ${cwd}` : "",
+                    command ? `Command: ${command}` : "",
+                    installLogs ? `\nInstall logs:\n${installLogs}` : "",
+                    startupLogs ? `\nStartup logs:\n${startupLogs}` : "",
+                    nextPreviewUrl ? `\nPreview URL: ${nextPreviewUrl}` : "",
+                ]
+                    .filter(Boolean)
+                    .join("\n"),
+            )
+            setHasRunError(false)
+
+            if (nextPreviewUrl) {
+                window.dispatchEvent(
+                    new CustomEvent("terminal:set-tab", {
+                        detail: { tab: "preview" },
+                    }),
+                )
+            }
+
+            toast.dismiss("project-runner")
+            toast.success("Project is running")
+            return true
+        } catch (error: any) {
+            const errorMessage =
+                axios.isAxiosError(error) && !error.response
+                    ? `Cannot reach backend at ${BACKEND_URL}.`
+                    : error?.response?.data?.error ||
+                      error?.message ||
+                      "Failed to start project runner"
+            setOutput(errorMessage)
+            setHasRunError(true)
+            setDiagnostics([])
+            setOutputMode("text")
+            setPreviewUrl("")
+            window.dispatchEvent(
+                new CustomEvent("terminal:set-tab", {
+                    detail: { tab: "output" },
+                }),
+            )
+            toast.dismiss("project-runner")
+            toast.error(errorMessage)
+            return true
+        } finally {
+            setIsRunning(false)
+        }
+    }
+
     const runCode = async () => {
+        const projectStarted = await runProjectApp()
+        if (projectStarted) {
+            return
+        }
+
         if (!activeFile) {
             return toast.error("Please open a file to run the code")
         }
@@ -458,7 +769,9 @@ const RunCodeContextProvider = ({ children }: { children: ReactNode }) => {
                 setInput,
                 output,
                 outputMode,
+                previewUrl,
                 isRunning,
+                isStoppingRunner,
                 hasRunError,
                 diagnostics,
                 diagnosticFileId,
@@ -466,6 +779,8 @@ const RunCodeContextProvider = ({ children }: { children: ReactNode }) => {
                 selectedLanguage,
                 setSelectedLanguage,
                 runCode,
+                stopProjectRunner,
+                openPreviewInNewTab,
             }}
         >
             {children}

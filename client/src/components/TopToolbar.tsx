@@ -1,4 +1,4 @@
-import { VscRunAll } from "react-icons/vsc"
+import { VscDebugStop, VscRunAll } from "react-icons/vsc"
 import { Button } from "@/components/ui/button"
 import { useRunCode } from "@/context/RunCodeContext"
 import { useAppContext } from "@/context/AppContext"
@@ -7,7 +7,7 @@ import GitHubCorner from "@/components/GitHubCorner"
 import Dropdown from "@/components/common/Dropdown"
 
 const TopToolbar = () => {
-    const { runCode } = useRunCode()
+    const { runCode, stopProjectRunner, previewUrl, isRunning, isStoppingRunner } = useRunCode()
     const { autoSaveEnabled, setAutoSaveEnabled } = useAppContext()
     const { saveWorkspaceNow } = useFileSystem()
 
@@ -19,9 +19,19 @@ const TopToolbar = () => {
                     className="sidebar-modern-btn sidebar-modern-btn--primary h-9 px-4"
                     size="sm"
                     onClick={runCode}
+                    disabled={isRunning || isStoppingRunner}
                 >
                     <VscRunAll className="mr-2 h-5 w-5" />
                     Run
+                </Button>
+                <Button
+                    className="sidebar-modern-btn h-9 px-4"
+                    size="sm"
+                    onClick={stopProjectRunner}
+                    disabled={!previewUrl || isRunning || isStoppingRunner}
+                >
+                    <VscDebugStop className="mr-2 h-5 w-5" />
+                    {isStoppingRunner ? "Stopping..." : "Stop"}
                 </Button>
                 <Button
                     className={`h-9 px-4 ${

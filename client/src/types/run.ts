@@ -14,7 +14,9 @@ interface RunContext {
     setInput: (input: string) => void
     output: string
     outputMode: "text" | "html"
+    previewUrl: string
     isRunning: boolean
+    isStoppingRunner: boolean
     hasRunError: boolean
     diagnostics: RunDiagnostic[]
     diagnosticFileId: string | null
@@ -22,6 +24,8 @@ interface RunContext {
     selectedLanguage: Language
     setSelectedLanguage: (language: Language) => void
     runCode: () => void
+    stopProjectRunner: () => void
+    openPreviewInNewTab: () => void
 }
 
 export { Language, RunContext, RunDiagnostic }
