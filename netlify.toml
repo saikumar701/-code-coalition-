@@ -5,7 +5,7 @@
 
 [build.environment]
   NODE_VERSION = "20"
-  VITE_BACKEND_URL = "https://code-coalition-backend-production.up.railway.app"
+  VITE_BACKEND_URL = "https://code-coalition.onrender.com"
 
 [[redirects]]
   from = "/*"

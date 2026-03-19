@@ -24,10 +24,7 @@ services:
         destination: /index.html
     envVars:
       - key: VITE_BACKEND_URL
-        fromService:
-          type: web
-          name: code-coalition-backend
-          envVarKey: RENDER_EXTERNAL_URL
+        value: https://code-coalition.onrender.com
       - key: VITE_FILE_SHARE_MAX_MB
         fromService:
           type: web
