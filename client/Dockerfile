@@ -4,7 +4,7 @@ FROM node:18-alpine AS builder
 WORKDIR /build
 
 # Accept backend URL as build argument
-ARG VITE_BACKEND_URL=https://code-coalition.onrender.com
+ARG VITE_BACKEND_URL=https://code-coalition-1.onrender.com
 ENV VITE_BACKEND_URL=$VITE_BACKEND_URL
 
 # Copy package files and install dependencies

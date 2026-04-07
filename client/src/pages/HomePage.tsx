@@ -43,10 +43,15 @@ function HomePage() {
                                 {openMenu === "features" && (
                                     <ul className="space-y-2 text-sm text-gray-300">
                                         <li>• AI Assistant</li>
+                                        <li>• Live cursor tracking</li>
                                         <li>• Chat Box</li>
                                         <li>• Collaborative Board</li>
                                         <li>• Multiple Themes</li>
                                         <li>• Multi-language Support</li>
+                                        <li>• Screen Sharing</li>
+                                        <li>• Github and Gdrive file integration</li>
+                                        <li>• File sharing</li>
+                                        <li>• Teminal and Preview</li>
                                     </ul>
                                 )}
 
