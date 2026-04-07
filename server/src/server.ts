@@ -2656,61 +2656,64 @@ app.post("/api/copilot/generate", async (req: Request, res: Response) => {
 				: "You are a coding copilot for the Code Coalition project. Return only Markdown code blocks with no explanation outside the code block."
 		const finalMessage = `${baseSystemPrompt}\n\nUser request:\n${userPrompt}`
 
-			const response = await fetch("https://apifreellm.com/api/v1/chat", {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					Authorization: `Bearer ${apiFreeLlmKey}`,
-				},
-				body: JSON.stringify({
-					message: finalMessage,
-					model: selectedModel,
-				}),
-			})
-
-			const rawBody = await response.text()
-			const data = safeParseJson(rawBody) as
-				| {
-						response?: string
-						text?: string
-						error?: string
-						message?: string
-						tier?: unknown
-						features?: unknown
-					}
-				| null
-			if (!response.ok) {
-				console.error("API Free LLM error:", response.status, data || rawBody)
-				return res.status(response.status).json({
-					error:
-						data?.error ||
-						data?.message ||
-						(rawBody ? `API Free LLM error: ${rawBody.slice(0, 200)}` : "API Free LLM request failed"),
+			// Prefer Gemini to avoid upstream HTML/403 issues
+			const geminiApiKey = (process.env.GEMINI_API_KEY || "").trim()
+			if (!geminiApiKey) {
+				return res.status(500).json({
+					error: "GEMINI_API_KEY is not configured on the server.",
 				})
 			}
 
-			const text =
-				typeof data?.response === "string"
-					? data.response.trim()
-					: typeof data?.text === "string"
-						? data.text.trim()
-						: ""
-			if (!text) {
-				console.error("API Free LLM returned empty response:", data)
-				return res
-					.status(502)
-					.json({
-						error: "API Free LLM returned an empty response",
-						details: rawBody ? rawBody.slice(0, 200) : undefined,
-					})
+			const geminiModel =
+				(typeof model === "string" && model.trim().length > 0
+					? model.trim()
+					: process.env.GEMINI_MODEL)?.trim() || "gemini-2.5-flash"
+
+			const geminiResp = await fetch(
+				`https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${geminiApiKey}`,
+				{
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({
+						contents: [{ parts: [{ text: finalMessage }] }],
+					}),
+				},
+			)
+
+			const geminiData = (await geminiResp.json().catch(() => null)) as
+				| {
+						candidates?: Array<{
+							content?: { parts?: Array<{ text?: string }> }
+						}>
+						error?: { message?: string }
+					}
+				| null
+
+			if (!geminiResp.ok) {
+				const message =
+					(geminiData as any)?.error?.message ||
+					"Gemini request failed"
+				console.error("Gemini error:", geminiResp.status, message)
+				return res.status(geminiResp.status).json({ error: message })
 			}
 
-		return res.json({
-			text,
-			model: selectedModel,
-			tier: data?.tier,
-			features: data?.features,
-		})
+			const text =
+				geminiData?.candidates?.[0]?.content?.parts
+					?.map((p) => (p.text || "").trim())
+					.filter(Boolean)
+					.join("\n") || ""
+
+			if (!text) {
+				console.error("Gemini returned empty response:", geminiData)
+				return res.status(502).json({ error: "Gemini returned an empty response" })
+			}
+
+			return res.json({
+				text,
+				model: geminiModel,
+			})
 	} catch (error) {
 		console.error("Copilot API error:", error)
 		res.status(500).json({ error: `Failed to generate code: ${(error as Error).message}` })
