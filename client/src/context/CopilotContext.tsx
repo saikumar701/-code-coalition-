@@ -41,7 +41,8 @@ const CopilotContextProvider = ({ children }: { children: ReactNode }) => {
                 COPILOT_ENDPOINT,
                 {
                     prompt: trimmedInput,
-                    model: "apifreellm",
+                    // Use Gemini by default; server will fall back if omitted.
+                    model: "gemini-2.5-flash",
                     systemPrompt:
                         "You are Code Coalition Copilot. You can answer general questions, explain errors, and generate code. If the user asks for code, provide runnable code in fenced markdown blocks and keep explanations concise. If the user asks general questions, respond normally in clear markdown.",
                 },
