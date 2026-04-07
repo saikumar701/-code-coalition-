@@ -22,6 +22,21 @@ FROM node:18-alpine AS runner
 
 WORKDIR /app
 
+# Install bash, curl, and programming language runtimes
+RUN apk add --no-cache \
+    bash \
+    curl \
+    python3 \
+    py3-pip \
+    openjdk11 \
+    gcc \
+    g++ \
+    make \
+    gdb \
+    git \
+    nodejs \
+    npm
+
 # Copy the `dist` folder from the builder stage
 COPY --from=builder /build/dist dist/
 COPY --from=builder /build/public public/
