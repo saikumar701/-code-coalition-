@@ -2675,6 +2675,8 @@ app.post("/api/copilot/generate", async (req: Request, res: Response) => {
 						text?: string
 						error?: string
 						message?: string
+						tier?: unknown
+						features?: unknown
 					}
 				| null
 			if (!response.ok) {
