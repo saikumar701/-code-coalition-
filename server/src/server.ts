@@ -107,6 +107,14 @@ const localFallbackRuntimes: PistonRuntime[] = [
 	},
 ]
 
+function safeParseJson(raw: string): unknown {
+	try {
+		return JSON.parse(raw)
+	} catch {
+		return null
+	}
+}
+
 interface WorkspaceFileSystemItem {
 	id: string
 	name: string
@@ -2648,41 +2656,52 @@ app.post("/api/copilot/generate", async (req: Request, res: Response) => {
 				: "You are a coding copilot for the Code Coalition project. Return only Markdown code blocks with no explanation outside the code block."
 		const finalMessage = `${baseSystemPrompt}\n\nUser request:\n${userPrompt}`
 
-		const response = await fetch("https://apifreellm.com/api/v1/chat", {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${apiFreeLlmKey}`,
-			},
-			body: JSON.stringify({
-				message: finalMessage,
-				model: selectedModel,
-			}),
-		})
-
-		const data = await response.json()
-		if (!response.ok) {
-			console.error("API Free LLM error:", response.status, data)
-			return res.status(response.status).json({
-				error:
-					data?.error ||
-					data?.message ||
-					"API Free LLM request failed",
+			const response = await fetch("https://apifreellm.com/api/v1/chat", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${apiFreeLlmKey}`,
+				},
+				body: JSON.stringify({
+					message: finalMessage,
+					model: selectedModel,
+				}),
 			})
-		}
 
-		const text =
-			typeof data?.response === "string"
-				? data.response.trim()
-				: typeof data?.text === "string"
-					? data.text.trim()
-					: ""
-		if (!text) {
-			console.error("API Free LLM returned empty response:", data)
-			return res
-				.status(502)
-				.json({ error: "API Free LLM returned an empty response" })
-		}
+			const rawBody = await response.text()
+			const data = safeParseJson(rawBody) as
+				| {
+						response?: string
+						text?: string
+						error?: string
+						message?: string
+					}
+				| null
+			if (!response.ok) {
+				console.error("API Free LLM error:", response.status, data || rawBody)
+				return res.status(response.status).json({
+					error:
+						data?.error ||
+						data?.message ||
+						(rawBody ? `API Free LLM error: ${rawBody.slice(0, 200)}` : "API Free LLM request failed"),
+				})
+			}
+
+			const text =
+				typeof data?.response === "string"
+					? data.response.trim()
+					: typeof data?.text === "string"
+						? data.text.trim()
+						: ""
+			if (!text) {
+				console.error("API Free LLM returned empty response:", data)
+				return res
+					.status(502)
+					.json({
+						error: "API Free LLM returned an empty response",
+						details: rawBody ? rawBody.slice(0, 200) : undefined,
+					})
+			}
 
 		return res.json({
 			text,
